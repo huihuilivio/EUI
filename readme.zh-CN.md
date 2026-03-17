@@ -5,6 +5,7 @@
 EUI 是一个轻量、头文件式（header-only）的 C++ UI 工具包，偏重实际可用的即时模式（immediate-mode）工作流。
 核心 API 在 `include/EUI.h` 中，只负责产出绘制命令。
 当启用 `EUI_ENABLE_GLFW_OPENGL_BACKEND` 时，可使用内置的 GLFW + OpenGL demo 运行时。
+当前版本已经补齐了更完整的文本链路，覆盖混合文本/图标渲染、可编辑输入框和可滚动文本编辑框。
 
 ## 预览
 
@@ -31,8 +32,12 @@ EUI 是一个轻量、头文件式（header-only）的 C++ UI 工具包，偏重
   - 通过 `FrameContext` 回调驱动你写的 UI。
 - **渲染层（同在 `EUI.h`）**
   - OpenGL 指令渲染，支持裁剪与批处理。
-  - Windows 下使用 GDI/wgl 字形列表渲染文字，并支持图标字体回退。
-  - 非 Windows 路径保留了内置位图字体回退逻辑。
+- 可选使用 `stb_truetype` 渲染文本/图标并带字形纹理缓存（检测到 `stb_truetype.h` 时自动启用）。
+- 文本测量会跟随当前实际渲染后端配置，尽量保证光标、选区、换行和命中测试与最终渲染结果一致。
+- 采用“文本字体 + 图标字体”双字体回退（私有区码点优先图标字体）。
+- 图标字体默认使用仓库内置 `include/Font Awesome 7 Free-Solid-900.otf`，文本继续使用系统默认字体。
+- 仅在字体加载或渲染失败时回退到内置位图文字路径。
+- 也可在编译时通过 `-DEUI_ENABLE_STB_TRUETYPE=0` 强制关闭 STB 路径。
 
 ### 2）当前渲染链路
 
@@ -52,6 +57,13 @@ EUI 是一个轻量、头文件式（header-only）的 C++ UI 工具包，偏重
 - 缓存帧缓冲纹理 + 脏区局部刷新。
 - Core 层有 clip stack 与命令级裁剪。
 - 命令量较大时启用基于 tile 的命令分桶。
+
+### 4）文本与编辑模型
+
+- 单行输入框支持光标移动、拖拽选区、剪贴板快捷键，以及随光标自动水平滚动。
+- `text_area` 支持多行编辑、自动换行、拖拽选区、滚动，以及带 `preferred x` 的 `Up` / `Down` 光标导航。
+- 混合文本 + 图标时会做 icon-aware 测量，选区和光标位置会尽量贴近实际渲染结果。
+- demo 运行时已接管编辑类按键的重复输入，包括 `Backspace`、`Delete`、`Enter`、方向键、`Home`、`End`。
 
 ## 已实现功能
 
@@ -76,7 +88,7 @@ EUI 是一个轻量、头文件式（header-only）的 C++ UI 工具包，偏重
 ### 控件
 
 - `label`
-- `button`（`Primary`、`Secondary`、`Ghost`）
+- `button`（`Primary`、`Secondary`、`Ghost`，额外支持 `text_scale`）
 - `tab`
 - `slider_float`（拖动 + 右键数值编辑）
 - `input_float`（光标、选区、`Ctrl+A/C/V/X`）
@@ -102,9 +114,12 @@ EUI 是一个轻量、头文件式（header-only）的 C++ UI 工具包，偏重
 EUI/
 |- include/
 |  `- EUI.h
+|  |- stb_truetype.h
+|  `- Font Awesome 7 Free-Solid-900.otf
 |- examples/
 |  |- basic_demo.cpp
 |  |- calculator_demo.cpp
+|  |- minimal_demo.cpp
 |  `- layout_examples_demo.cpp
 |- CMakeLists.txt
 |- index.html
@@ -139,6 +154,7 @@ cmake --build build
 - `eui_demo`（`examples/basic_demo.cpp`）
 - `eui_calculator_demo`（`examples/calculator_demo.cpp`）
 - `eui_layout_examples_demo`（`examples/layout_examples_demo.cpp`）
+- `eui_minimal_demo`（`examples/minimal_demo.cpp`）
 
 重要 CMake 选项：
 
@@ -147,6 +163,7 @@ cmake --build build
 -DEUI_STRICT_WARNINGS=ON|OFF
 -DEUI_FETCH_GLFW_FROM_GIT=ON|OFF
 -DEUI_GLFW_GIT_TAG=3.4
+-DEUI_ENABLE_STB_TRUETYPE=1|0
 ```
 
 若网络或 Git 不可用：
@@ -166,6 +183,9 @@ cmake --build build --target eui_calculator_demo
 
 # 布局示例 demo
 cmake --build build --target eui_layout_examples_demo
+
+# 极简 demo
+cmake --build build --target eui_minimal_demo
 ```
 
 ## 核心最小用法
@@ -211,12 +231,12 @@ const auto& text_arena = ui.text_arena();
 ### 侧边栏图标与文本垂直对齐方案
 
 - 侧边栏按钮如果需要左对齐，请在 `label` 前加 `\t`，会启用左对齐并带左侧内边距。
-- 图标 + 文本请使用 **两个 ASCII 空格** 分隔（例如 `u8"\uE80F  Dashboard"`）。
+- 图标 + 文本请使用 **两个 ASCII 空格** 分隔（例如 `u8"\uF015  Dashboard"`）。
 - EUI 会把图标和文本拆开分别渲染，垂直居中会稳定很多。
 
 ```cpp
 // 左对齐侧边栏项：图标 + 文本，垂直居中更稳定
-ui.button("\t" u8"\uE80F  Dashboard", eui::ButtonStyle::Secondary, 34.0f);
+ui.button("\t" u8"\uF015  Dashboard", eui::ButtonStyle::Secondary, 34.0f);
 ```
 
 ### 1）侧边栏 + 主内容
@@ -304,7 +324,12 @@ int main() {
 
     options.text_font_family = "Segoe UI";
     options.text_font_weight = 600; // 100-900，值越大越粗
-    options.icon_font_family = "Segoe MDL2 Assets";
+    options.icon_font_family = "Font Awesome 7 Free Solid";
+    options.icon_font_file = "include/Font Awesome 7 Free-Solid-900.otf";
+    options.text_backend = eui::demo::AppOptions::TextBackend::Auto;
+    // 非 Windows 建议显式指定字体文件路径，图标显示更稳定。
+    // options.text_font_file = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+    // options.icon_font_file = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
     options.enable_icon_font_fallback = true;
 
     return eui::demo::run(
@@ -323,6 +348,18 @@ int main() {
     );
 }
 ```
+
+### 文本后端说明
+
+- `AppOptions::TextBackend::Auto`
+  - Windows 下若启用了 `stb_truetype`，默认优先走 STB 文本路径，否则回退到 Win32 文本渲染。
+  - 非 Windows 下若可用，则优先走 STB 文本路径。
+- `AppOptions::TextBackend::Stb`
+  - 使用 `stb_truetype` 做字形栅格化和纹理图集缓存。
+- `AppOptions::TextBackend::Win32`
+  - 仅限 Windows，使用基于 GDI/WGL 的文本渲染路径。
+
+如果要提升图标覆盖率，建议保留 `enable_icon_font_fallback = true`，并显式携带图标字体文件。
 
 ## 说明
 

@@ -100,8 +100,10 @@ int main() {
     options.height = 600;
     options.vsync = true;
     options.continuous_render = false;
-    options.max_fps = 120.0;
+    options.max_fps = 240.0;
     options.text_font_weight = 900;
+    options.icon_font_family = "Font Awesome 7 Free Solid";
+    options.icon_font_file = "include/Font Awesome 7 Free-Solid-900.otf";
 
     return eui::demo::run(
         [&](eui::demo::FrameContext frame) {
@@ -322,93 +324,98 @@ int main() {
 
             const float key_h = dp(62.0f);
             const float key_gap = dp(8.0f);
+            const float key_text_scale = 1.16f;
+            const auto key_button = [&](std::string_view label,
+                                        eui::ButtonStyle style = eui::ButtonStyle::Secondary) {
+                return ui.button(label, style, key_h, key_text_scale);
+            };
 
             ui.begin_row(4, key_gap);
-            if (ui.button("%", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("%")) {
                 input_percent();
             }
-            if (ui.button("CE", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("CE")) {
                 clear_entry();
             }
-            if (ui.button("C", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("C")) {
                 calc_clear(state);
             }
-            if (ui.button(u8"\u232B", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button(u8"\uF060")) {
                 backspace();
             }
             ui.end_row();
 
             ui.begin_row(4, key_gap);
-            if (ui.button("1/x", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("1/x")) {
                 input_inverse();
             }
-            if (ui.button(u8"x\u00B2", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("x²")) {
                 input_square();
             }
-            if (ui.button(u8"\u00B2\u221Ax", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button(u8"\u221Ax")) {
                 input_sqrt();
             }
-            if (ui.button(u8"\u00F7", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button(u8"\u00F7")) {
                 input_operator('/');
             }
             ui.end_row();
 
             ui.begin_row(4, key_gap);
-            if (ui.button("7", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("7")) {
                 input_digit('7');
             }
-            if (ui.button("8", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("8")) {
                 input_digit('8');
             }
-            if (ui.button("9", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("9")) {
                 input_digit('9');
             }
-            if (ui.button(u8"\u00D7", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button(u8"\u00D7")) {
                 input_operator('*');
             }
             ui.end_row();
 
             ui.begin_row(4, key_gap);
-            if (ui.button("4", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("4")) {
                 input_digit('4');
             }
-            if (ui.button("5", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("5")) {
                 input_digit('5');
             }
-            if (ui.button("6", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("6")) {
                 input_digit('6');
             }
-            if (ui.button("-", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("-")) {
                 input_operator('-');
             }
             ui.end_row();
 
             ui.begin_row(4, key_gap);
-            if (ui.button("1", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("1")) {
                 input_digit('1');
             }
-            if (ui.button("2", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("2")) {
                 input_digit('2');
             }
-            if (ui.button("3", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("3")) {
                 input_digit('3');
             }
-            if (ui.button("+", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("+")) {
                 input_operator('+');
             }
             ui.end_row();
 
             ui.begin_row(4, key_gap);
-            if (ui.button(state.dark_mode ? u8"\u2600" : u8"\u263D", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button(state.dark_mode ? u8"\uF185" : u8"\uF186")) {
                 state.dark_mode = !state.dark_mode;
             }
-            if (ui.button("0", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button("0")) {
                 input_digit('0');
             }
-            if (ui.button(".", eui::ButtonStyle::Secondary, key_h)) {
+            if (key_button(".")) {
                 input_digit('.');
             }
-            if (ui.button("=", eui::ButtonStyle::Primary, key_h)) {
+            if (key_button("=", eui::ButtonStyle::Primary)) {
                 eval_equal();
             }
             ui.end_row();

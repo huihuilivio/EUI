@@ -5,6 +5,7 @@
 EUI is a lightweight, header-only C++ UI toolkit focused on practical immediate-mode workflows.
 The core API in `include/EUI.h` generates draw commands only.
 A GLFW + OpenGL demo runtime is available when `EUI_ENABLE_GLFW_OPENGL_BACKEND` is enabled.
+It now includes a more complete text pipeline for mixed text/icon rendering, editable inputs, and scrolling text areas.
 
 ## Preview
 
@@ -31,8 +32,12 @@ A GLFW + OpenGL demo runtime is available when `EUI_ENABLE_GLFW_OPENGL_BACKEND` 
   - Calls your UI builder callback with `FrameContext`.
 - **Renderer layer (inside `EUI.h`)**
   - OpenGL command renderer with clipping and batching.
-  - Win32 path uses GDI/wgl glyph lists for font rendering (text + icon fallback).
-  - Non-Windows path includes a built-in bitmap-font fallback path.
+- Optional `stb_truetype` renderer for text/icons with glyph texture caching (auto-enabled when `stb_truetype.h` is available).
+- Text measurement is configured to follow the active renderer backend so caret, selection, wrapping, and hit-testing stay aligned with what is actually rendered.
+- Uses text font + icon font fallback (private-use codepoints prefer icon font).
+- Icon font defaults to bundled `include/Font Awesome 7 Free-Solid-900.otf`; text keeps system default.
+- Falls back to built-in bitmap text only when font loading/rendering fails.
+- You can force-disable STB at compile time with `-DEUI_ENABLE_STB_TRUETYPE=0`.
 
 ### 2) Rendering Pipeline
 
@@ -52,6 +57,13 @@ A GLFW + OpenGL demo runtime is available when `EUI_ENABLE_GLFW_OPENGL_BACKEND` 
 - Cached framebuffer texture + partial redraw via scissor.
 - Clip stack + command clipping in core.
 - Tile-assisted command bucketing for large command counts.
+
+### 4) Text / Editing Model
+
+- Single-line inputs support caret movement, drag selection, clipboard shortcuts, and horizontal scroll-to-caret.
+- `text_area` supports multi-line editing, wrapping, drag selection, scrolling, and `Up` / `Down` caret navigation with preferred x tracking.
+- Mixed text + icon labels use icon-aware measurement so selection and caret placement stay closer to rendered output.
+- The demo runtime handles key repeat for editing keys such as `Backspace`, `Delete`, `Enter`, arrows, `Home`, and `End`.
 
 ## Implemented Features
 
@@ -76,7 +88,7 @@ A GLFW + OpenGL demo runtime is available when `EUI_ENABLE_GLFW_OPENGL_BACKEND` 
 ### Widgets
 
 - `label`
-- `button` (`Primary`, `Secondary`, `Ghost`)
+- `button` (`Primary`, `Secondary`, `Ghost`, optional `text_scale`)
 - `tab`
 - `slider_float` (drag + right-click numeric edit)
 - `input_float` (caret, selection, `Ctrl+A/C/V/X`)
@@ -102,9 +114,12 @@ A GLFW + OpenGL demo runtime is available when `EUI_ENABLE_GLFW_OPENGL_BACKEND` 
 EUI/
 |- include/
 |  `- EUI.h
+|  |- stb_truetype.h
+|  `- Font Awesome 7 Free-Solid-900.otf
 |- examples/
 |  |- basic_demo.cpp
 |  |- calculator_demo.cpp
+|  |- minimal_demo.cpp
 |  `- layout_examples_demo.cpp
 |- CMakeLists.txt
 |- index.html
@@ -139,6 +154,7 @@ When OpenGL + GLFW are available, CMake creates:
 - `eui_demo` (`examples/basic_demo.cpp`)
 - `eui_calculator_demo` (`examples/calculator_demo.cpp`)
 - `eui_layout_examples_demo` (`examples/layout_examples_demo.cpp`)
+- `eui_minimal_demo` (`examples/minimal_demo.cpp`)
 
 Important options:
 
@@ -147,6 +163,7 @@ Important options:
 -DEUI_STRICT_WARNINGS=ON|OFF
 -DEUI_FETCH_GLFW_FROM_GIT=ON|OFF
 -DEUI_GLFW_GIT_TAG=3.4
+-DEUI_ENABLE_STB_TRUETYPE=1|0
 ```
 
 If network/Git access is restricted:
@@ -166,6 +183,9 @@ cmake --build build --target eui_calculator_demo
 
 # layout examples demo
 cmake --build build --target eui_layout_examples_demo
+
+# minimal demo
+cmake --build build --target eui_minimal_demo
 ```
 
 ## Minimal Core Usage
@@ -211,12 +231,12 @@ const auto& text_arena = ui.text_arena();
 ### Sidebar Icon/Text Vertical Alignment
 
 - For left-aligned sidebar buttons, prefix label with `\t` to enable left align with built-in left padding.
-- For icon + text, use **two ASCII spaces** between them (for example `u8"\uE80F  Dashboard"`).
+- For icon + text, use **two ASCII spaces** between them (for example `u8"\uF015  Dashboard"`).
 - EUI will split icon/text and render them separately, which keeps vertical alignment stable.
 
 ```cpp
 // Left-aligned nav item with icon + text (stable vertical centering)
-ui.button("\t" u8"\uE80F  Dashboard", eui::ButtonStyle::Secondary, 34.0f);
+ui.button("\t" u8"\uF015  Dashboard", eui::ButtonStyle::Secondary, 34.0f);
 ```
 
 ### 1) Sidebar + Main Content
@@ -304,7 +324,12 @@ int main() {
 
     options.text_font_family = "Segoe UI";
     options.text_font_weight = 600; // 100-900, larger = bolder
-    options.icon_font_family = "Segoe MDL2 Assets";
+    options.icon_font_family = "Font Awesome 7 Free Solid";
+    options.icon_font_file = "include/Font Awesome 7 Free-Solid-900.otf";
+    options.text_backend = eui::demo::AppOptions::TextBackend::Auto;
+    // Optional but recommended on non-Windows: set explicit font file paths.
+    // options.text_font_file = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+    // options.icon_font_file = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
     options.enable_icon_font_fallback = true;
 
     return eui::demo::run(
@@ -323,6 +348,18 @@ int main() {
     );
 }
 ```
+
+### Text Backend Notes
+
+- `AppOptions::TextBackend::Auto`
+  - On Windows, prefers the STB text path when `stb_truetype` is enabled; otherwise falls back to Win32 text rendering.
+  - On non-Windows, uses the STB text path when available.
+- `AppOptions::TextBackend::Stb`
+  - Uses `stb_truetype` glyph rasterization and atlas caching.
+- `AppOptions::TextBackend::Win32`
+  - Windows-only text renderer based on GDI/WGL font APIs.
+
+For best icon coverage, keep `enable_icon_font_fallback = true` and ship an explicit icon font file.
 
 ## Notes
 

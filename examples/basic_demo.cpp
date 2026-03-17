@@ -20,8 +20,8 @@ float g_content_margin = 20.0f;
 float g_content_top = 18.0f;
 const char* g_text_font_family = "Segoe UI";
 const char* g_text_font_file = nullptr;
-const char* g_icon_font_family = "Segoe MDL2 Assets";
-const char* g_icon_font_file = nullptr;
+const char* g_icon_font_family = "Font Awesome 7 Free Solid";
+const char* g_icon_font_file = "include/Font Awesome 7 Free-Solid-900.otf";
 
 eui::Color g_theme_primary = eui::rgba(0.282f, 0.827f, 0.835f, 1.0f);
 float g_theme_radius = 10.0f;
@@ -47,18 +47,17 @@ struct DemoState {
 };
 
 std::string g_story_text =
-    u8"\uE713 \uE8A5 \uE80F  icon row | \U0001F44F \U0001F31F \U0001F642 \U0001F680 \u2728\n"
-    u8"tiny hands clap \U0001F44F\U0001F44F, smiles shine \U0001F31F\U0001F31F, hearts glow \u2665 and vibes stay warm.\n"
-    u8"toolbox line: \U0001F527 \U0001F6E0 \U0001F4CC \U0001F4DD \U0001F4AC \u2705 \U0001F3AF \U0001F525\n"
-    u8"mail + sparkles: \u2709 \u2728 and everyone says hi \U0001F44B with bright eyes \U0001F60A.\n"
+    u8"\uF0C9 \uF002 \uF013 \uF0E0  icon row\n"
+    u8"status line: \uF0AE sync  \uF201 chart  \uF0C0 users  \uF07B projects\n"
+    u8"team line: \uF005 favorite  \uF007 contact  \uF201 chart  \uF0C0 users\n"
+    u8"tools line: \uF060 back  \uF061 forward  \uF002 search  \uF0E0 mail\n"
     u8"design notes: keep rhythm, keep contrast, keep spacing, keep corners clean.\n"
     u8"interaction notes: smooth hover, stable click, readable text, clear hierarchy.\n"
-    u8"team notes: small progress every day, one bug less, one smile more \U0001F31F.\n"
-    u8"cute line: little paws tap tap, little hands clap clap \U0001F44F\U0001F44F, everybody shines.\n"
-    u8"status line: build \U0001F680 test \u2705 review \U0001F4DD ship \U0001F389 repeat.\n"
-    u8"bonus icons: \u2600 \u2601 \u2615 \u2699 \u2764 \U0001F525 \U0001F44D \U0001F680 \U0001F31F.\n"
+    u8"team notes: small progress every day, one bug less, one smile more.\n"
+    u8"workflow: \uF0C9 nav  \uF002 find  \uF013 settings  \uF0E0 message.\n"
+    u8"bonus icons: \uF0C9 \uF060 \uF061 \uF002 \uF013 \uF005 \uF0E0 \uF007.\n"
     u8"long text keeps wrapping at the edge and you can scroll to read more lines.\n"
-    u8"have a great day, keep coding, and let every screen feel friendly \U0001F60A";
+    u8"have a great day, keep coding, and let every screen feel friendly.";
 
 static void open_external_url(const char* url) {
     if (url == nullptr || url[0] == '\0') {
@@ -123,7 +122,7 @@ int main() {
             ui.begin_row(9, dp(6.0f));
             ui.label(dpi_text, dp(12.0f), true);
             ui.row_flex_spacer(1, dp(12.0f));
-            const char* theme_icon = state.dark_mode ? u8"\u2600" : u8"\u263D";
+            const char* theme_icon = state.dark_mode ? u8"\uF185" : u8"\uF186";
             if (ui.button(theme_icon, eui::ButtonStyle::Secondary, dp(24.0f))) {
                 state.dark_mode = !state.dark_mode;
             }
@@ -142,20 +141,20 @@ int main() {
             ui.begin_card("ICON DEMO", dp(200.0f));
             ui.label("SYSTEM ICONS 2 x 4", dp(11.0f), true);
             ui.begin_row(2, dp(8.0f));
-            ui.button(u8"\uE700  MENU", eui::ButtonStyle::Secondary, dp(30.0f));
-            ui.button(u8"\uE710  BACK", eui::ButtonStyle::Secondary, dp(30.0f));
+            ui.button(u8"\uF0C9  MENU", eui::ButtonStyle::Secondary, dp(30.0f));
+            ui.button(u8"\uF060  BACK", eui::ButtonStyle::Secondary, dp(30.0f));
             ui.end_row();
             ui.begin_row(2, dp(8.0f));
-            ui.button(u8"\uE711  FORWARD", eui::ButtonStyle::Secondary, dp(30.0f));
-            ui.button(u8"\uE721  SEARCH", eui::ButtonStyle::Secondary, dp(30.0f));
+            ui.button(u8"\uF061  FORWARD", eui::ButtonStyle::Secondary, dp(30.0f));
+            ui.button(u8"\uF002  SEARCH", eui::ButtonStyle::Secondary, dp(30.0f));
             ui.end_row();
             ui.begin_row(2, dp(8.0f));
-            ui.button(u8"\uE713  SETTINGS", eui::ButtonStyle::Secondary, dp(30.0f));
-            ui.button(u8"\uE8A5  FAVORITE", eui::ButtonStyle::Secondary, dp(30.0f));
+            ui.button(u8"\uF013  SETTINGS", eui::ButtonStyle::Secondary, dp(30.0f));
+            ui.button(u8"\uF005  FAVORITE", eui::ButtonStyle::Secondary, dp(30.0f));
             ui.end_row();
             ui.begin_row(2, dp(8.0f));
-            ui.button(u8"\uE80F  MAIL", eui::ButtonStyle::Secondary, dp(30.0f));
-            ui.button(u8"\uE8BB  CONTACT", eui::ButtonStyle::Secondary, dp(30.0f));
+            ui.button(u8"\uF0E0  MAIL", eui::ButtonStyle::Secondary, dp(30.0f));
+            ui.button(u8"\uF007  CONTACT", eui::ButtonStyle::Secondary, dp(30.0f));
             ui.end_row();
             ui.end_card();
 

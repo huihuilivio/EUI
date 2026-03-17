@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -36,9 +37,59 @@
 
 #include <array>
 #include <iostream>
+#include <limits>
+#include <memory>
 
 #ifndef GL_MULTISAMPLE
 #define GL_MULTISAMPLE 0x809D
+#endif
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE 0x812F
+#endif
+#ifndef GL_ALPHA
+#define GL_ALPHA 0x1906
+#endif
+
+#ifndef EUI_ENABLE_STB_TRUETYPE
+#if defined(__has_include)
+#if __has_include("stb_truetype.h")
+#define EUI_ENABLE_STB_TRUETYPE 1
+#else
+#define EUI_ENABLE_STB_TRUETYPE 0
+#endif
+#else
+#define EUI_ENABLE_STB_TRUETYPE 0
+#endif
+#endif
+
+#if EUI_ENABLE_STB_TRUETYPE
+#ifndef EUI_STB_TRUETYPE_INCLUDED
+#define EUI_STB_TRUETYPE_INCLUDED
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4505)
+#endif
+#ifndef STBTT_STATIC
+#define STBTT_STATIC
+#define EUI_UNDEF_STBTT_STATIC
+#endif
+#ifndef STB_TRUETYPE_IMPLEMENTATION
+#define STB_TRUETYPE_IMPLEMENTATION
+#define EUI_UNDEF_STBTT_IMPLEMENTATION
+#endif
+#include "stb_truetype.h"
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+#ifdef EUI_UNDEF_STBTT_IMPLEMENTATION
+#undef STB_TRUETYPE_IMPLEMENTATION
+#undef EUI_UNDEF_STBTT_IMPLEMENTATION
+#endif
+#ifdef EUI_UNDEF_STBTT_STATIC
+#undef STBTT_STATIC
+#undef EUI_UNDEF_STBTT_STATIC
+#endif
+#endif
 #endif
 #endif
 
@@ -64,6 +115,8 @@ inline Color mix(const Color& lhs, const Color& rhs, float t) {
         lhs.a + (rhs.a - lhs.a) * t,
     };
 }
+
+inline constexpr float k_icon_visual_scale = 0.86f;
 
 inline float srgb_to_linear(float value) {
     value = std::clamp(value, 0.0f, 1.0f);
@@ -126,6 +179,12 @@ enum class ButtonStyle {
     Primary,
     Secondary,
     Ghost,
+};
+
+enum class TextMeasureBackend {
+    Approx,
+    Win32,
+    Stb,
 };
 
 struct Theme {
@@ -207,6 +266,8 @@ struct InputState {
     bool key_escape{false};
     bool key_left{false};
     bool key_right{false};
+    bool key_up{false};
+    bool key_down{false};
     bool key_home{false};
     bool key_end{false};
     bool key_select_all{false};
@@ -247,6 +308,9 @@ struct DrawCommand {
 };
 
 class Context {
+#if EUI_ENABLE_STB_TRUETYPE
+    struct StbMeasureFont;
+#endif
 public:
     Context() {
         commands_.reserve(1024);
@@ -254,6 +318,11 @@ public:
         text_arena_.reserve(16 * 1024);
         input_buffer_.reserve(64);
         theme_.radius = corner_radius_;
+    }
+
+    ~Context() {
+        release_text_measure_cache();
+        release_stb_measure_cache();
     }
 
     void set_theme_mode(ThemeMode mode) {
@@ -284,6 +353,41 @@ public:
 
     const Theme& theme() const {
         return theme_;
+    }
+
+    void configure_text_measure(TextMeasureBackend backend, std::string_view family, int weight,
+                                std::string_view font_file = {}, std::string_view icon_family = {},
+                                std::string_view icon_file = {}, bool enable_icon_fallback = true) {
+        const std::string resolved_family =
+            family.empty() ? std::string("Segoe UI") : std::string(family);
+        const int resolved_weight = std::clamp(weight, 100, 900);
+        const std::string resolved_file = std::string(font_file);
+        const std::string resolved_icon_family =
+            icon_family.empty() ? std::string("Font Awesome 7 Free Solid") : std::string(icon_family);
+        const std::string resolved_icon_file = std::string(icon_file);
+
+        const bool backend_changed = text_measure_backend_ != backend;
+        const bool family_changed = text_measure_font_family_ != resolved_family;
+        const bool weight_changed = text_measure_font_weight_ != resolved_weight;
+        const bool file_changed = text_measure_font_file_ != resolved_file;
+        const bool icon_family_changed = text_measure_icon_font_family_ != resolved_icon_family;
+        const bool icon_file_changed = text_measure_icon_font_file_ != resolved_icon_file;
+        const bool icon_fallback_changed = text_measure_enable_icon_fallback_ != enable_icon_fallback;
+
+        text_measure_backend_ = backend;
+        text_measure_font_family_ = resolved_family;
+        text_measure_font_weight_ = resolved_weight;
+        text_measure_font_file_ = resolved_file;
+        text_measure_icon_font_family_ = resolved_icon_family;
+        text_measure_icon_font_file_ = resolved_icon_file;
+        text_measure_enable_icon_fallback_ = enable_icon_fallback;
+
+        if (backend_changed || family_changed || weight_changed || icon_family_changed || icon_fallback_changed) {
+            release_text_measure_cache();
+        }
+        if (backend_changed || file_changed || icon_file_changed || icon_fallback_changed) {
+            release_stb_measure_cache();
+        }
     }
 
     void begin_frame(float width, float height, const InputState& input) {
@@ -509,11 +613,13 @@ public:
         row_.next_span = std::max(1, columns);
     }
 
-    bool button(std::string_view label, ButtonStyle style = ButtonStyle::Secondary, float height = 34.0f) {
+    bool button(std::string_view label, ButtonStyle style = ButtonStyle::Secondary, float height = 34.0f,
+                float text_scale = 1.0f) {
         const Rect rect = next_rect(height);
         const bool hovered = rect.contains(input_.mouse_x, input_.mouse_y);
         const bool held = hovered && input_.mouse_down;
         std::string_view draw_label = label;
+        const float resolved_text_scale = std::clamp(text_scale, 0.6f, 2.0f);
         const bool force_left_align = !draw_label.empty() && draw_label.front() == '\t';
         if (force_left_align) {
             draw_label.remove_prefix(1);
@@ -529,8 +635,10 @@ public:
                 }
             }
         }
-        const float text_size = icon_like ? std::clamp(rect.h * 0.72f, 16.0f, 34.0f)
-                                          : std::clamp(rect.h * 0.38f, 12.0f, 28.0f);
+        const float text_size = icon_like
+                                    ? std::clamp(rect.h * 0.72f * k_icon_visual_scale * resolved_text_scale, 13.0f,
+                                                 36.0f)
+                                    : std::clamp(rect.h * 0.38f * resolved_text_scale, 12.0f, 34.0f);
 
         // For labels like "<icon>  TEXT", draw icon/text separately to keep visual vertical alignment.
         bool icon_text_combo = false;
@@ -575,8 +683,10 @@ public:
         if (icon_text_combo) {
             const float pad = force_left_align ? std::clamp(rect.h * 0.24f, 9.0f, 14.0f)
                                                : std::clamp(rect.h * 0.24f, 8.0f, 14.0f);
-            const float icon_size = force_left_align ? std::clamp(rect.h * 0.46f, 11.0f, 22.0f)
-                                                     : std::clamp(rect.h * 0.60f, 13.0f, 34.0f);
+            const float icon_size =
+                force_left_align
+                    ? std::clamp(rect.h * 0.46f * k_icon_visual_scale * resolved_text_scale, 10.0f, 24.0f)
+                    : std::clamp(rect.h * 0.60f * k_icon_visual_scale * resolved_text_scale, 12.0f, 36.0f);
             const float icon_w = force_left_align ? std::max(icon_size + 2.0f, rect.h * 0.44f)
                                                   : std::max(14.0f, rect.h - pad * 0.2f);
             const Rect icon_rect{
@@ -593,8 +703,9 @@ public:
                 std::max(0.0f, rect.x + rect.w - text_x - pad),
                 rect.h,
             };
-            const float combo_text_size = force_left_align ? std::clamp(rect.h * 0.37f, 12.0f, 24.0f)
-                                                           : std::clamp(rect.h * 0.35f, 11.0f, 24.0f);
+            const float combo_text_size =
+                force_left_align ? std::clamp(rect.h * 0.37f * resolved_text_scale, 12.0f, 30.0f)
+                                 : std::clamp(rect.h * 0.35f * resolved_text_scale, 11.0f, 30.0f);
             add_text(icon_part, icon_rect, text_color, icon_size, TextAlign::Center);
             add_text(text_part, text_rect, text_color, combo_text_size, TextAlign::Left);
         } else {
@@ -826,10 +937,7 @@ public:
             if (value_text.empty()) {
                 value_text = "0";
             }
-            add_text(value_text,
-                     Rect{input_rect.x + input_padding, input_rect.y,
-                          input_rect.w - input_padding * 2.0f, input_rect.h},
-                     theme_.text, value_font, TextAlign::Right);
+            draw_static_input_content(input_rect, value_text, value_font, true, input_padding, theme_.text);
         }
 
         return changed;
@@ -901,15 +1009,10 @@ public:
             draw_text_input_content(input_rect, value_font, align_right, input_padding, theme_.text,
                                     mix(theme_.primary, theme_.input_bg, 0.55f));
         } else if (value.empty() && !placeholder.empty()) {
-            add_text(placeholder,
-                     Rect{input_rect.x + input_padding, input_rect.y,
-                          input_rect.w - input_padding * 2.0f, input_rect.h},
-                     theme_.muted_text, value_font, align_right ? TextAlign::Right : TextAlign::Left);
+            draw_static_input_content(input_rect, placeholder, value_font, align_right, input_padding,
+                                      theme_.muted_text);
         } else {
-            add_text(value,
-                     Rect{input_rect.x + input_padding, input_rect.y,
-                          input_rect.w - input_padding * 2.0f, input_rect.h},
-                     theme_.text, value_font, align_right ? TextAlign::Right : TextAlign::Left);
+            draw_static_input_content(input_rect, value, value_font, align_right, input_padding, theme_.text);
         }
 
         return value != before;
@@ -949,10 +1052,8 @@ public:
         }
         add_filled_rect(input_rect, mix(theme_.input_bg, theme_.secondary, 0.08f), theme_.radius - 2.0f);
         add_outline_rect(input_rect, theme_.input_border, theme_.radius - 2.0f, 1.0f);
-        add_text(value,
-                 Rect{input_rect.x + input_padding, input_rect.y,
-                      input_rect.w - input_padding * 2.0f, input_rect.h},
-                 muted ? theme_.muted_text : theme_.text, value_font, align_right ? TextAlign::Right : TextAlign::Left);
+        draw_static_input_content(input_rect, value, value_font, align_right, input_padding,
+                                  muted ? theme_.muted_text : theme_.text);
     }
 
     struct ScrollAreaOptions {
@@ -1201,9 +1302,6 @@ public:
         const float scrollbar_w = 8.0f;
         const float text_pad = std::clamp(rect.h * 0.03f, 6.0f, 10.0f);
         const float content_w = std::max(24.0f, box_rect.w - text_pad * 2.0f - 2.0f);
-        const float char_w = std::max(3.6f, text_font * 0.42f);
-        const int max_chars_per_line =
-            std::max(1, static_cast<int>(std::floor(content_w / char_w)));
         const Rect content_clip{
             box_rect.x + text_pad,
             box_rect.y + text_pad,
@@ -1215,6 +1313,7 @@ public:
         TextAreaState& state = text_area_state_[id];
         const bool hovered_box = box_rect.contains(input_.mouse_x, input_.mouse_y);
         bool editing = is_text_input_active(id);
+        bool follow_caret = false;
 
         if (input_.mouse_pressed) {
             if (hovered_box) {
@@ -1234,37 +1333,47 @@ public:
                 stop_text_input();
                 editing = false;
             } else {
+                follow_caret = input_.key_home || input_.key_end || input_.key_left || input_.key_right ||
+                               input_.key_backspace || input_.key_delete || input_.key_enter ||
+                               input_.key_paste || !input_.text_input.empty();
                 consume_plain_typing(true);
                 text = input_buffer_;
             }
         }
 
         const std::string_view text_view = editing ? std::string_view(input_buffer_) : std::string_view(text);
-        const auto count_chars = [&](std::size_t start, std::size_t end) -> int {
-            if (end <= start) {
-                return 0;
-            }
-            start = std::min(start, text_view.size());
-            end = std::min(end, text_view.size());
-            int count = 0;
-            std::size_t idx = start;
-            while (idx < end) {
-                idx = utf8_next_index(text_view, idx);
-                count += 1;
-            }
-            return count;
-        };
 
         struct WrappedLine {
             std::size_t start{0u};
             std::size_t len{0u};
-            int chars{0};
+            std::vector<std::size_t> boundaries{};
+            std::vector<float> offsets{};
         };
         std::vector<WrappedLine> lines;
         lines.reserve(64);
+        auto push_wrapped_line = [&](std::size_t start, std::size_t end,
+                                     const std::vector<std::size_t>& boundaries,
+                                     const std::vector<float>& offsets) {
+            WrappedLine line{};
+            line.start = start;
+            line.len = end - start;
+            line.boundaries = boundaries;
+            line.offsets = offsets;
+            if (line.boundaries.empty()) {
+                line.boundaries.push_back(start);
+                line.offsets.push_back(0.0f);
+            }
+            if (line.boundaries.back() != end) {
+                line.boundaries.push_back(end);
+                line.offsets.push_back(line.offsets.empty() ? 0.0f : line.offsets.back());
+            }
+            lines.push_back(std::move(line));
+        };
         std::size_t line_start = 0u;
         std::size_t index = 0u;
-        int line_chars = 0;
+        float line_width = 0.0f;
+        std::vector<std::size_t> line_boundaries{line_start};
+        std::vector<float> line_offsets{0.0f};
         while (index < text_view.size()) {
             const unsigned char ch = static_cast<unsigned char>(text_view[index]);
             if (ch == '\r') {
@@ -1272,23 +1381,35 @@ public:
                 continue;
             }
             if (ch == '\n') {
-                lines.push_back(WrappedLine{line_start, index - line_start, line_chars});
+                push_wrapped_line(line_start, index, line_boundaries, line_offsets);
                 index += 1u;
                 line_start = index;
-                line_chars = 0;
+                line_width = 0.0f;
+                line_boundaries.assign(1u, line_start);
+                line_offsets.assign(1u, 0.0f);
                 continue;
             }
-            if (line_chars >= max_chars_per_line) {
-                lines.push_back(WrappedLine{line_start, index - line_start, line_chars});
+
+            std::size_t next = index;
+            std::uint32_t cp = 0u;
+            decode_utf8_at(text_view, index, text_view.size(), cp, next);
+            const float advance = codepoint_advance(text_view, index, next, cp, text_font);
+            if (line_width > 0.0f && line_width + advance > content_w) {
+                push_wrapped_line(line_start, index, line_boundaries, line_offsets);
                 line_start = index;
-                line_chars = 0;
+                line_width = 0.0f;
+                line_boundaries.assign(1u, line_start);
+                line_offsets.assign(1u, 0.0f);
+                continue;
             }
-            index = utf8_next_index(text_view, index);
-            line_chars += 1;
+            index = next;
+            line_width += advance;
+            line_boundaries.push_back(index);
+            line_offsets.push_back(line_width);
         }
-        lines.push_back(WrappedLine{line_start, text_view.size() - line_start, line_chars});
+        push_wrapped_line(line_start, text_view.size(), line_boundaries, line_offsets);
         if (lines.empty()) {
-            lines.push_back(WrappedLine{0u, 0u, 0});
+            lines.push_back(WrappedLine{0u, 0u, std::vector<std::size_t>{0u}, std::vector<float>{0.0f}});
         }
 
         const float viewport_h = content_clip.h;
@@ -1315,6 +1436,24 @@ public:
             state.scroll = std::clamp(state.scroll, 0.0f, max_scroll);
         }
 
+        auto boundary_index_for_byte = [&](const WrappedLine& line, std::size_t byte_pos) -> std::size_t {
+            if (line.boundaries.empty()) {
+                return 0u;
+            }
+            const auto it = std::lower_bound(line.boundaries.begin(), line.boundaries.end(), byte_pos);
+            if (it == line.boundaries.end()) {
+                return line.boundaries.size() - 1u;
+            }
+            return static_cast<std::size_t>(it - line.boundaries.begin());
+        };
+
+        auto line_x_for_byte = [&](const WrappedLine& line, std::size_t byte_pos) -> float {
+            if (line.offsets.empty()) {
+                return 0.0f;
+            }
+            return line.offsets[boundary_index_for_byte(line, byte_pos)];
+        };
+
         auto caret_from_point = [&](float mouse_x, float mouse_y) -> std::size_t {
             if (lines.empty()) {
                 return 0u;
@@ -1325,18 +1464,25 @@ public:
             line_index = std::min(line_index, lines.size() - 1u);
             const WrappedLine& line = lines[line_index];
             const float rel_x = std::max(0.0f, mouse_x - content_clip.x);
-            const int char_index =
-                std::clamp(static_cast<int>(std::floor(rel_x / char_w + 0.5f)), 0, line.chars);
-            std::size_t pos = line.start;
-            for (int i = 0; i < char_index && pos < line.start + line.len; ++i) {
-                pos = utf8_next_index(text_view, pos);
+            if (line.boundaries.size() <= 1u) {
+                return line.start;
             }
-            return std::min(pos, line.start + line.len);
+            for (std::size_t i = 1u; i < line.boundaries.size(); ++i) {
+                const float left_x = line.offsets[i - 1u];
+                const float right_x = line.offsets[i];
+                if (rel_x < left_x + (right_x - left_x) * 0.5f) {
+                    return line.boundaries[i - 1u];
+                }
+                if (rel_x < right_x) {
+                    return line.boundaries[i];
+                }
+            }
+            return line.boundaries.back();
         };
 
-        auto resolve_caret_visual = [&](std::size_t caret_pos) -> std::pair<std::size_t, int> {
+        auto resolve_caret_visual = [&](std::size_t caret_pos) -> std::pair<std::size_t, std::size_t> {
             if (lines.empty()) {
-                return {0u, 0};
+                return {0u, 0u};
             }
             const std::size_t clamped_caret = std::min(caret_pos, text_view.size());
             for (std::size_t i = 0; i < lines.size(); ++i) {
@@ -1346,26 +1492,72 @@ public:
                 const std::size_t next_start = has_next ? lines[i + 1u].start : line_end_idx;
 
                 if (clamped_caret < line_start_idx) {
-                    return {i, 0};
+                    return {i, 0u};
                 }
                 if (clamped_caret < line_end_idx) {
-                    return {i, count_chars(line_start_idx, clamped_caret)};
+                    return {i, boundary_index_for_byte(lines[i], clamped_caret)};
                 }
                 if (clamped_caret == line_end_idx) {
                     // Wrapped lines share a boundary; prefer next line start to avoid end/start jitter.
                     if (has_next && next_start == line_end_idx) {
-                        return {i + 1u, 0};
+                        return {i + 1u, 0u};
                     }
-                    return {i, count_chars(line_start_idx, clamped_caret)};
+                    return {i, boundary_index_for_byte(lines[i], clamped_caret)};
                 }
                 if (has_next && clamped_caret < next_start) {
-                    return {i, lines[i].chars};
+                    return {i, lines[i].boundaries.empty() ? 0u : lines[i].boundaries.size() - 1u};
                 }
             }
-            return {lines.size() - 1u, lines.back().chars};
+            return {lines.size() - 1u, lines.back().boundaries.empty() ? 0u : lines.back().boundaries.size() - 1u};
+        };
+
+        auto caret_x_in_line = [&](std::size_t line_index, std::size_t caret_boundary) -> float {
+            if (lines.empty()) {
+                return 0.0f;
+            }
+            line_index = std::min(line_index, lines.size() - 1u);
+            const WrappedLine& line = lines[line_index];
+            if (line.offsets.empty()) {
+                return 0.0f;
+            }
+            caret_boundary = std::min(caret_boundary, line.offsets.size() - 1u);
+            return line.offsets[caret_boundary];
+        };
+
+        auto caret_for_line_x = [&](std::size_t line_index, float target_x) -> std::size_t {
+            if (lines.empty()) {
+                return 0u;
+            }
+            line_index = std::min(line_index, lines.size() - 1u);
+            const WrappedLine& line = lines[line_index];
+            if (target_x <= 0.0f) {
+                return line.start;
+            }
+            if (line.boundaries.size() <= 1u) {
+                return line.start;
+            }
+            for (std::size_t i = 1u; i < line.boundaries.size(); ++i) {
+                const float left_x = line.offsets[i - 1u];
+                const float right_x = line.offsets[i];
+                if (target_x < left_x + (right_x - left_x) * 0.5f) {
+                    return line.boundaries[i - 1u];
+                }
+                if (target_x < right_x) {
+                    return line.boundaries[i];
+                }
+            }
+            return line.boundaries.back();
         };
 
         if (editing) {
+            const bool reset_preferred_x =
+                input_.mouse_pressed || input_.key_left || input_.key_right || input_.key_home || input_.key_end ||
+                input_.key_backspace || input_.key_delete || input_.key_enter || input_.key_paste ||
+                !input_.text_input.empty();
+            if (reset_preferred_x) {
+                state.preferred_x = -1.0f;
+            }
+
             if (input_.mouse_pressed && content_clip.contains(input_.mouse_x, input_.mouse_y) &&
                 !hovered_thumb) {
                 const std::size_t caret = caret_from_point(input_.mouse_x, input_.mouse_y);
@@ -1374,6 +1566,8 @@ public:
                 selection_end_ = caret;
                 drag_anchor_ = caret;
                 drag_selecting_ = true;
+                state.preferred_x = -1.0f;
+                follow_caret = true;
             }
             if (drag_selecting_ && input_.mouse_down) {
                 const float clamped_x = std::clamp(input_.mouse_x, content_clip.x, content_clip.x + content_clip.w);
@@ -1382,18 +1576,43 @@ public:
                 caret_pos_ = caret;
                 selection_start_ = drag_anchor_;
                 selection_end_ = caret;
+                state.preferred_x = -1.0f;
+                follow_caret = true;
             }
             if (input_.mouse_released) {
                 drag_selecting_ = false;
             }
 
-            const auto caret_visual = resolve_caret_visual(caret_pos_);
-            const std::size_t caret_line = caret_visual.first;
-            const float caret_top = static_cast<float>(caret_line) * line_h;
-            if (caret_top < state.scroll) {
-                state.scroll = caret_top;
-            } else if (caret_top + line_h > state.scroll + viewport_h) {
-                state.scroll = caret_top + line_h - viewport_h;
+            if ((input_.key_up || input_.key_down) && !lines.empty()) {
+                const auto caret_visual = resolve_caret_visual(caret_pos_);
+                const std::size_t caret_line = caret_visual.first;
+                const std::size_t caret_byte = caret_visual.second;
+                if (state.preferred_x < 0.0f) {
+                    state.preferred_x = caret_x_in_line(caret_line, caret_byte);
+                }
+
+                std::size_t target_line = caret_line;
+                if (input_.key_up && caret_line > 0u) {
+                    target_line = caret_line - 1u;
+                } else if (input_.key_down && caret_line + 1u < lines.size()) {
+                    target_line = caret_line + 1u;
+                }
+
+                if (target_line != caret_line) {
+                    set_caret(caret_for_line_x(target_line, state.preferred_x), input_.key_shift);
+                }
+                follow_caret = true;
+            }
+
+            if (follow_caret) {
+                const auto caret_visual = resolve_caret_visual(caret_pos_);
+                const std::size_t caret_line = caret_visual.first;
+                const float caret_top = static_cast<float>(caret_line) * line_h;
+                if (caret_top < state.scroll) {
+                    state.scroll = caret_top;
+                } else if (caret_top + line_h > state.scroll + viewport_h) {
+                    state.scroll = caret_top + line_h - viewport_h;
+                }
             }
             state.scroll = std::clamp(state.scroll, 0.0f, max_scroll);
         }
@@ -1429,6 +1648,7 @@ public:
         if (editing && has_selection()) {
             const std::size_t sel_l = selection_left();
             const std::size_t sel_r = selection_right();
+            const float selection_pad_x = std::max(1.0f, text_font * 0.08f);
             float y = content_clip.y - line_offset;
             for (std::size_t i = first_line; i < lines.size(); ++i) {
                 if (y > content_clip.y + content_clip.h) {
@@ -1440,13 +1660,13 @@ public:
                 const std::size_t hi_l = std::max(sel_l, line_start_idx);
                 const std::size_t hi_r = std::min(sel_r, line_end_idx);
                 if (hi_r > hi_l && y + line_h >= content_clip.y) {
-                    const int before_chars = count_chars(line_start_idx, hi_l);
-                    const int selected_chars = count_chars(hi_l, hi_r);
+                    const float before_w = line_x_for_byte(line, hi_l);
+                    const float selected_w = line_x_for_byte(line, hi_r) - before_w;
                     Rect sel_rect{
-                        content_clip.x + static_cast<float>(before_chars) * char_w,
-                        y + 1.0f,
-                        static_cast<float>(selected_chars) * char_w,
-                        std::max(2.0f, line_h - 2.0f),
+                        content_clip.x + before_w - selection_pad_x,
+                        y,
+                        std::max(0.0f, selected_w) + selection_pad_x * 2.0f,
+                        std::max(2.0f, line_h),
                     };
                     Rect clipped{};
                     if (intersect_rects(sel_rect, content_clip, clipped)) {
@@ -1473,15 +1693,17 @@ public:
         if (editing && should_show_caret()) {
             const auto caret_visual = resolve_caret_visual(caret_pos_);
             const std::size_t caret_line = caret_visual.first;
-            const int caret_chars = caret_visual.second;
-            const float caret_y = content_clip.y - line_offset + static_cast<float>(caret_line) * line_h;
-            const float caret_x =
-                std::min(content_clip.x + content_clip.w - 1.0f, content_clip.x + static_cast<float>(caret_chars) * char_w);
+            const std::size_t caret_boundary = caret_visual.second;
+            const float caret_y = content_clip.y + static_cast<float>(caret_line) * line_h - state.scroll;
+            const float caret_w = caret_x_in_line(caret_line, caret_boundary);
+            float caret_x = content_clip.x + caret_w;
+            const float caret_h = std::max(2.0f, line_h - 2.0f);
+            caret_x = std::clamp(caret_x, content_clip.x, content_clip.x + content_clip.w - 1.0f);
             Rect caret_rect{
                 caret_x,
                 caret_y + 1.0f,
                 std::max(1.4f, text_font * 0.08f),
-                std::max(2.0f, line_h - 2.0f),
+                caret_h,
             };
             Rect clipped{};
             if (intersect_rects(caret_rect, content_clip, clipped)) {
@@ -1521,15 +1743,12 @@ public:
             content_w,
             std::max(24.0f, box_rect.h - text_pad * 2.0f),
         };
-        const float wrap_char_w = std::max(3.6f, text_font * 0.42f);
-        const int max_chars_per_line =
-            std::max(1, static_cast<int>(std::floor(content_w / wrap_char_w)));
 
         std::vector<std::pair<std::size_t, std::size_t>> lines;
         lines.reserve(64);
         std::size_t line_start = 0u;
         std::size_t index = 0u;
-        int line_chars = 0;
+        float line_width = 0.0f;
         while (index < text.size()) {
             const unsigned char ch = static_cast<unsigned char>(text[index]);
             if (ch == '\r') {
@@ -1540,16 +1759,22 @@ public:
                 lines.emplace_back(line_start, index - line_start);
                 index += 1u;
                 line_start = index;
-                line_chars = 0;
+                line_width = 0.0f;
                 continue;
             }
-            if (line_chars >= max_chars_per_line) {
+
+            std::size_t next = index;
+            std::uint32_t cp = 0u;
+            decode_utf8_at(text, index, text.size(), cp, next);
+            const float advance = codepoint_advance(text, index, next, cp, text_font);
+            if (line_width > 0.0f && line_width + advance > content_w) {
                 lines.emplace_back(line_start, index - line_start);
                 line_start = index;
-                line_chars = 0;
+                line_width = 0.0f;
+                continue;
             }
-            index = utf8_next_index(text, index);
-            line_chars += 1;
+            index = next;
+            line_width += advance;
         }
         lines.emplace_back(line_start, text.size() - line_start);
         if (lines.empty()) {
@@ -1822,8 +2047,9 @@ private:
         std::vector<float> column_y{};
     };
 
-    struct TextAreaState {
+struct TextAreaState {
         float scroll{0.0f};
+        float preferred_x{-1.0f};
     };
 
     struct ScrollAreaState {
@@ -2066,31 +2292,488 @@ private:
         return i;
     }
 
+#if defined(_WIN32) && defined(EUI_ENABLE_GLFW_OPENGL_BACKEND)
+    static std::wstring utf8_to_wide_measure(std::string_view text) {
+        if (text.empty()) {
+            return {};
+        }
+        const int needed =
+            MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), nullptr, 0);
+        if (needed <= 0) {
+            std::wstring fallback;
+            fallback.reserve(text.size());
+            for (unsigned char ch : text) {
+                fallback.push_back(static_cast<wchar_t>(ch));
+            }
+            return fallback;
+        }
+        std::wstring wide(static_cast<std::size_t>(needed), L'\0');
+        const int written = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+                                                static_cast<int>(text.size()), wide.data(), needed);
+        if (written <= 0) {
+            return {};
+        }
+        return wide;
+    }
+
+    HDC ensure_text_measure_hdc() const {
+        if (text_measure_hdc_ == nullptr) {
+            text_measure_hdc_ = CreateCompatibleDC(nullptr);
+        }
+        return text_measure_hdc_;
+    }
+
+    static int measure_codepoint_to_utf16(std::uint32_t cp, wchar_t out[2]) {
+        if (cp <= 0xFFFFu) {
+            out[0] = static_cast<wchar_t>(cp);
+            out[1] = L'\0';
+            return 1;
+        }
+        out[0] = L'\0';
+        out[1] = L'\0';
+        return 0;
+    }
+
+    static bool is_private_use_codepoint_measure(std::uint32_t cp) {
+        return cp >= 0xE000u && cp <= 0xF8FFu;
+    }
+
+    HFONT ensure_text_measure_font(bool icon_font, int px) const {
+        const int clamped_px = std::max(8, px);
+        const std::string& family_name = icon_font ? text_measure_icon_font_family_ : text_measure_font_family_;
+        const int font_weight = icon_font ? 400 : text_measure_font_weight_;
+        const std::string key =
+            std::string(icon_font ? "icon:" : "text:") + family_name + "#" + std::to_string(font_weight) + "#" +
+            std::to_string(clamped_px);
+        auto it = text_measure_fonts_.find(key);
+        if (it != text_measure_fonts_.end()) {
+            return it->second;
+        }
+
+        std::wstring family = utf8_to_wide_measure(family_name);
+        if (family.empty()) {
+            family = icon_font ? L"Font Awesome 7 Free Solid" : L"Segoe UI";
+        }
+        HFONT font = CreateFontW(-clamped_px, 0, 0, 0, font_weight, FALSE, FALSE, FALSE,
+                                 DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                 DEFAULT_PITCH | FF_DONTCARE, family.c_str());
+        if (font == nullptr) {
+            font = CreateFontW(-clamped_px, 0, 0, 0, font_weight, FALSE, FALSE, FALSE,
+                               DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                               DEFAULT_PITCH | FF_DONTCARE, icon_font ? L"Segoe UI Symbol" : L"Segoe UI");
+        }
+        if (font == nullptr) {
+            font = CreateFontW(-clamped_px, 0, 0, 0, font_weight, FALSE, FALSE, FALSE,
+                               DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                               DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+        }
+        text_measure_fonts_[key] = font;
+        return font;
+    }
+#endif
+
+    void release_text_measure_cache() const {
+#if defined(_WIN32) && defined(EUI_ENABLE_GLFW_OPENGL_BACKEND)
+        for (auto& pair : text_measure_fonts_) {
+            if (pair.second != nullptr) {
+                DeleteObject(pair.second);
+            }
+        }
+        text_measure_fonts_.clear();
+        if (text_measure_hdc_ != nullptr) {
+            DeleteDC(text_measure_hdc_);
+            text_measure_hdc_ = nullptr;
+        }
+#endif
+    }
+
+    void release_stb_measure_cache() const {
+#if EUI_ENABLE_STB_TRUETYPE
+        stb_measure_fonts_.clear();
+#endif
+    }
+
+    bool measure_font_has_glyph(HDC hdc, HFONT font, std::uint32_t cp) const {
+#if defined(_WIN32) && defined(EUI_ENABLE_GLFW_OPENGL_BACKEND)
+        if (hdc == nullptr || font == nullptr) {
+            return false;
+        }
+        wchar_t wide[2] = {L'\0', L'\0'};
+        const int wide_len = measure_codepoint_to_utf16(cp, wide);
+        if (wide_len <= 0) {
+            return false;
+        }
+        HGDIOBJ old = SelectObject(hdc, font);
+        WORD glyph_index = 0xFFFFu;
+        const DWORD glyph_query = GetGlyphIndicesW(hdc, wide, wide_len, &glyph_index, GGI_MARK_NONEXISTING_GLYPHS);
+        if (old != nullptr) {
+            SelectObject(hdc, old);
+        }
+        return glyph_query != GDI_ERROR && glyph_index != 0xFFFFu;
+#else
+        (void)hdc;
+        (void)font;
+        (void)cp;
+        return false;
+#endif
+    }
+
+    float measure_text_width_runtime(std::uint32_t cp, float font_size) const {
+#if defined(_WIN32) && defined(EUI_ENABLE_GLFW_OPENGL_BACKEND)
+        HDC hdc = ensure_text_measure_hdc();
+        if (hdc == nullptr) {
+            return 0.0f;
+        }
+
+        const int text_font_px = std::max(8, static_cast<int>(std::round(font_size * 1.20f)));
+        const int icon_font_px = std::max(8, static_cast<int>(std::round(text_font_px * k_icon_visual_scale)));
+        HFONT text_font = ensure_text_measure_font(false, text_font_px);
+        HFONT icon_font = text_measure_enable_icon_fallback_ ? ensure_text_measure_font(true, icon_font_px) : nullptr;
+
+        HFONT measure_font = text_font;
+        const bool prefer_icon =
+            text_measure_enable_icon_fallback_ && icon_font != nullptr && is_private_use_codepoint_measure(cp);
+        if (prefer_icon && measure_font_has_glyph(hdc, icon_font, cp)) {
+            measure_font = icon_font;
+        } else if (text_font == nullptr || !measure_font_has_glyph(hdc, text_font, cp)) {
+            if (text_measure_enable_icon_fallback_ && icon_font != nullptr &&
+                measure_font_has_glyph(hdc, icon_font, cp)) {
+                measure_font = icon_font;
+            }
+        }
+
+        if (measure_font == nullptr) {
+            return 0.0f;
+        }
+
+        wchar_t wide[2] = {L'\0', L'\0'};
+        const int wide_len = measure_codepoint_to_utf16(cp, wide);
+        if (wide_len <= 0) {
+            return 0.0f;
+        }
+
+        HGDIOBJ old = SelectObject(hdc, measure_font);
+        SIZE size{};
+        if (GetTextExtentPoint32W(hdc, wide, wide_len, &size) == FALSE) {
+            size.cx = 0;
+        }
+        if (old != nullptr) {
+            SelectObject(hdc, old);
+        }
+        return std::max(0.0f, static_cast<float>(size.cx));
+#else
+        (void)cp;
+        (void)font_size;
+        return 0.0f;
+#endif
+    }
+
+    static int quantize_text_measure_font_px(int px) {
+        int clamped = std::max(8, px);
+        if (clamped <= 32) {
+            clamped = ((clamped + 1) / 2) * 2;
+        } else if (clamped <= 72) {
+            clamped = ((clamped + 2) / 4) * 4;
+        } else {
+            clamped = ((clamped + 4) / 8) * 8;
+        }
+        return std::clamp(clamped, 8, 200);
+    }
+
+    const StbMeasureFont* ensure_stb_measure_font(bool icon_font, int px) const {
+#if EUI_ENABLE_STB_TRUETYPE
+        const std::string& font_file = icon_font ? text_measure_icon_font_file_ : text_measure_font_file_;
+        if (font_file.empty()) {
+            return nullptr;
+        }
+
+        const int quantized_px = quantize_text_measure_font_px(px);
+        const std::string key =
+            std::string(icon_font ? "icon:" : "text:") + font_file + "#" + std::to_string(quantized_px);
+
+        auto it = stb_measure_fonts_.find(key);
+        if (it == stb_measure_fonts_.end()) {
+            StbMeasureFont font{};
+            font.data = read_file_bytes(font_file);
+            if (!font.data.empty() && stbtt_InitFont(&font.info, font.data.data(), 0) != 0) {
+                font.scale = stbtt_ScaleForPixelHeight(&font.info, static_cast<float>(quantized_px));
+                font.valid = font.scale > 0.0f;
+            }
+            it = stb_measure_fonts_.emplace(key, std::move(font)).first;
+        }
+        return it->second.valid ? &it->second : nullptr;
+#else
+        (void)icon_font;
+        (void)px;
+        return nullptr;
+#endif
+    }
+
+    float measure_text_width_stb(std::uint32_t cp, float font_size) const {
+#if EUI_ENABLE_STB_TRUETYPE
+        const int text_font_px = std::max(8, static_cast<int>(std::round(font_size * 1.20f)));
+        const int icon_font_px = std::max(8, static_cast<int>(std::round(text_font_px * k_icon_visual_scale)));
+        const StbMeasureFont* text_font = ensure_stb_measure_font(false, text_font_px);
+        const StbMeasureFont* icon_font =
+            text_measure_enable_icon_fallback_ ? ensure_stb_measure_font(true, icon_font_px) : nullptr;
+
+        auto glyph_index_for = [&](const StbMeasureFont* font) -> int {
+            if (font == nullptr || !font->valid) {
+                return 0;
+            }
+            return stbtt_FindGlyphIndex(&font->info, static_cast<int>(cp));
+        };
+
+        const StbMeasureFont* measure_font = text_font;
+        int glyph_index = glyph_index_for(text_font);
+        const bool prefer_icon =
+            text_measure_enable_icon_fallback_ && icon_font != nullptr && is_private_use_codepoint_measure(cp);
+        if (prefer_icon) {
+            const int icon_glyph_index = glyph_index_for(icon_font);
+            if (icon_glyph_index != 0) {
+                measure_font = icon_font;
+                glyph_index = icon_glyph_index;
+            }
+        } else if ((measure_font == nullptr || glyph_index == 0) && text_measure_enable_icon_fallback_) {
+            const int icon_glyph_index = glyph_index_for(icon_font);
+            if (icon_font != nullptr && icon_glyph_index != 0) {
+                measure_font = icon_font;
+                glyph_index = icon_glyph_index;
+            }
+        }
+
+        if (measure_font == nullptr || !measure_font->valid) {
+            return 0.0f;
+        }
+        if (glyph_index == 0 && cp != 0u) {
+            glyph_index = stbtt_FindGlyphIndex(&measure_font->info, static_cast<int>('?'));
+        }
+        if (glyph_index == 0) {
+            return 0.0f;
+        }
+        int advance = 0;
+        int lsb = 0;
+        stbtt_GetGlyphHMetrics(&measure_font->info, glyph_index, &advance, &lsb);
+        (void)lsb;
+        return std::max(0.0f, static_cast<float>(advance) * measure_font->scale);
+#else
+        (void)cp;
+        (void)font_size;
+        return 0.0f;
+#endif
+    }
+
+    static std::vector<unsigned char> read_file_bytes(const std::string& path) {
+        if (path.empty()) {
+            return {};
+        }
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs) {
+            return {};
+        }
+        ifs.seekg(0, std::ios::end);
+        const std::streamoff size = ifs.tellg();
+        if (size <= 0) {
+            return {};
+        }
+        ifs.seekg(0, std::ios::beg);
+        std::vector<unsigned char> bytes(static_cast<std::size_t>(size));
+        ifs.read(reinterpret_cast<char*>(bytes.data()), size);
+        if (!ifs) {
+            return {};
+        }
+        return bytes;
+    }
+
     static float approx_char_width(float font_size) {
         return std::max(5.0f, font_size * 0.58f);
     }
 
-    float text_origin_x(const Rect& input_rect, float font_size, bool align_right, float padding,
-                        std::size_t text_len) const {
-        const float char_w = approx_char_width(font_size);
-        const float text_w = static_cast<float>(text_len) * char_w;
-        if (!align_right) {
-            return input_rect.x + padding;
+    static bool decode_utf8_at(std::string_view text, std::size_t index, std::size_t limit, std::uint32_t& cp,
+                               std::size_t& next) {
+        cp = 0u;
+        next = index;
+        if (index >= text.size() || index >= limit) {
+            return false;
         }
-        const float desired = input_rect.x + input_rect.w - padding - text_w;
-        return std::max(input_rect.x + padding, desired);
+
+        const unsigned char lead = static_cast<unsigned char>(text[index]);
+        if (lead < 0x80u) {
+            cp = static_cast<std::uint32_t>(lead);
+            next = index + 1u;
+            return true;
+        }
+
+        if ((lead >> 5u) == 0x6u && index + 1u < limit) {
+            const unsigned char b1 = static_cast<unsigned char>(text[index + 1u]);
+            if ((b1 & 0xC0u) == 0x80u) {
+                cp = (static_cast<std::uint32_t>(lead & 0x1Fu) << 6u) |
+                     static_cast<std::uint32_t>(b1 & 0x3Fu);
+                next = index + 2u;
+                return true;
+            }
+        }
+        if ((lead >> 4u) == 0xEu && index + 2u < limit) {
+            const unsigned char b1 = static_cast<unsigned char>(text[index + 1u]);
+            const unsigned char b2 = static_cast<unsigned char>(text[index + 2u]);
+            if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u) {
+                cp = (static_cast<std::uint32_t>(lead & 0x0Fu) << 12u) |
+                     (static_cast<std::uint32_t>(b1 & 0x3Fu) << 6u) |
+                     static_cast<std::uint32_t>(b2 & 0x3Fu);
+                next = index + 3u;
+                return true;
+            }
+        }
+        if ((lead >> 3u) == 0x1Eu && index + 3u < limit) {
+            const unsigned char b1 = static_cast<unsigned char>(text[index + 1u]);
+            const unsigned char b2 = static_cast<unsigned char>(text[index + 2u]);
+            const unsigned char b3 = static_cast<unsigned char>(text[index + 3u]);
+            if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u && (b3 & 0xC0u) == 0x80u) {
+                cp = (static_cast<std::uint32_t>(lead & 0x07u) << 18u) |
+                     (static_cast<std::uint32_t>(b1 & 0x3Fu) << 12u) |
+                     (static_cast<std::uint32_t>(b2 & 0x3Fu) << 6u) |
+                     static_cast<std::uint32_t>(b3 & 0x3Fu);
+                next = index + 4u;
+                return true;
+            }
+        }
+
+        cp = static_cast<std::uint32_t>(lead);
+        next = index + 1u;
+        return false;
     }
 
-    std::size_t caret_from_mouse_x(const Rect& input_rect, float font_size, bool align_right, float padding,
-                                   std::size_t text_len, float mouse_x) const {
-        const float char_w = approx_char_width(font_size);
-        const float origin_x = text_origin_x(input_rect, font_size, align_right, padding, text_len);
+    static float approx_codepoint_advance(std::uint32_t cp, float font_size) {
+        constexpr float k_measure_correction = 0.92f;
+        const float base = std::max(5.0f, font_size);
+        if (cp <= 0x7Fu) {
+            const char ch = static_cast<char>(cp);
+            float factor = 0.52f;
+            if (ch == ' ') {
+                factor = 0.30f;
+            } else if (std::strchr(".,:;'`!|", ch) != nullptr) {
+                factor = 0.28f;
+            } else if (std::strchr("()[]{}ilIjtfr", ch) != nullptr) {
+                factor = 0.36f;
+            } else if (std::strchr("mwMW@#%&", ch) != nullptr) {
+                factor = 0.78f;
+            } else if (ch >= '0' && ch <= '9') {
+                factor = 0.52f;
+            } else if (ch >= 'A' && ch <= 'Z') {
+                factor = 0.58f;
+            } else if (ch >= 'a' && ch <= 'z') {
+                factor = 0.50f;
+            } else {
+                factor = 0.50f;
+            }
+            return std::max(3.0f, base * factor * k_measure_correction);
+        }
+
+        if ((cp >= 0x4E00u && cp <= 0x9FFFu) || (cp >= 0x3400u && cp <= 0x4DBFu) ||
+            (cp >= 0xAC00u && cp <= 0xD7AFu) || (cp >= 0x3040u && cp <= 0x30FFu)) {
+            return std::max(6.0f, base * 1.0f * k_measure_correction);
+        }
+        if (cp >= 0x1F300u && cp <= 0x1FAFFu) {
+            return std::max(6.0f, base * 1.05f * k_measure_correction);
+        }
+        return approx_char_width(font_size) * k_measure_correction;
+    }
+
+    float codepoint_advance(std::string_view text, std::size_t start, std::size_t end, std::uint32_t cp,
+                            float font_size) const {
+        if (end <= start || start >= text.size()) {
+            return 0.0f;
+        }
+        end = std::min(end, text.size());
+        float measured = 0.0f;
+        if (text_measure_backend_ == TextMeasureBackend::Win32) {
+            measured = measure_text_width_runtime(cp, font_size);
+        } else if (text_measure_backend_ == TextMeasureBackend::Stb) {
+            measured = measure_text_width_stb(cp, font_size);
+        }
+        if (measured <= 0.0f) {
+            measured = approx_codepoint_advance(cp, font_size);
+        }
+        return std::max(1.0f, measured);
+    }
+
+    float approx_text_width_until(std::string_view text, std::size_t byte_index, float font_size) const {
+        const std::size_t target = std::min(byte_index, text.size());
+        std::size_t index = 0u;
+        float width = 0.0f;
+        while (index < target) {
+            std::size_t next = index;
+            std::uint32_t cp = 0u;
+            decode_utf8_at(text, index, target, cp, next);
+            width += codepoint_advance(text, index, next, cp, font_size);
+            index = next;
+        }
+        return width;
+    }
+
+    float resolve_input_origin_x(const Rect& input_rect, float font_size, bool align_right, float padding,
+                                 std::string_view text, std::size_t caret_pos, bool follow_caret) {
+        const float text_w = approx_text_width_until(text, text.size(), font_size);
+        const float min_x = input_rect.x + padding;
+        const float content_w = std::max(0.0f, input_rect.w - padding * 2.0f);
+        if (content_w <= 0.0f) {
+            input_scroll_x_ = 0.0f;
+            return min_x;
+        }
+
+        if (align_right && text_w <= content_w) {
+            input_scroll_x_ = 0.0f;
+            return min_x + (content_w - text_w);
+        }
+
+        const float max_scroll = std::max(0.0f, text_w - content_w);
+        if (follow_caret) {
+            const float caret_w = approx_text_width_until(text, std::min(caret_pos, text.size()), font_size);
+            if (caret_w < input_scroll_x_) {
+                input_scroll_x_ = caret_w;
+            }
+            const float visible_w = std::max(1.0f, content_w - 1.0f);
+            if (caret_w > input_scroll_x_ + visible_w) {
+                input_scroll_x_ = caret_w - visible_w;
+            }
+        } else if (align_right && input_scroll_x_ <= 1e-4f && max_scroll > 0.0f) {
+            // Right-aligned numeric edit fields start by showing the tail.
+            input_scroll_x_ = max_scroll;
+        }
+
+        input_scroll_x_ = std::clamp(input_scroll_x_, 0.0f, max_scroll);
+        return min_x - input_scroll_x_;
+    }
+
+    std::size_t caret_from_mouse_x(float origin_x, float font_size, std::string_view text, float mouse_x,
+                                   float content_left, float content_right) const {
+        if (mouse_x <= content_left) {
+            return 0u;
+        }
+        if (mouse_x >= content_right - 1.0f) {
+            return text.size();
+        }
         const float rel_x = mouse_x - origin_x;
         if (rel_x <= 0.0f) {
             return 0u;
         }
-        const std::size_t raw = static_cast<std::size_t>(std::floor(rel_x / char_w + 0.5f));
-        return std::min(raw, text_len);
+        float pen_x = 0.0f;
+        std::size_t index = 0u;
+        while (index < text.size()) {
+            std::size_t next = index;
+            std::uint32_t cp = 0u;
+            decode_utf8_at(text, index, text.size(), cp, next);
+            const float advance = codepoint_advance(text, index, next, cp, font_size);
+            if (rel_x < pen_x + advance * 0.5f) {
+                return index;
+            }
+            pen_x += advance;
+            if (rel_x < pen_x) {
+                return next;
+            }
+            index = next;
+        }
+        return text.size();
     }
 
     bool has_selection() const {
@@ -2310,6 +2993,7 @@ private:
             select_all_text();
         }
         drag_selecting_ = false;
+        input_scroll_x_ = 0.0f;
     }
 
     bool is_text_input_active(std::uint64_t id) const {
@@ -2323,13 +3007,18 @@ private:
         selection_start_ = 0u;
         selection_end_ = 0u;
         drag_selecting_ = false;
+        input_scroll_x_ = 0.0f;
     }
 
     void update_mouse_selection(const Rect& input_rect, float font_size, bool align_right, float padding,
                                 bool hovered) {
+        const float origin_x =
+            resolve_input_origin_x(input_rect, font_size, align_right, padding, input_buffer_, caret_pos_, false);
+        const float content_left = input_rect.x + padding;
+        const float content_right = input_rect.x + input_rect.w - padding;
         if (hovered && input_.mouse_pressed) {
-            const std::size_t caret =
-                caret_from_mouse_x(input_rect, font_size, align_right, padding, input_buffer_.size(), input_.mouse_x);
+            const std::size_t caret = caret_from_mouse_x(origin_x, font_size, input_buffer_, input_.mouse_x,
+                                                         content_left, content_right);
             caret_pos_ = caret;
             selection_start_ = caret;
             selection_end_ = caret;
@@ -2338,8 +3027,8 @@ private:
         }
 
         if (drag_selecting_ && input_.mouse_down) {
-            const std::size_t caret =
-                caret_from_mouse_x(input_rect, font_size, align_right, padding, input_buffer_.size(), input_.mouse_x);
+            const std::size_t caret = caret_from_mouse_x(origin_x, font_size, input_buffer_, input_.mouse_x,
+                                                         content_left, content_right);
             caret_pos_ = caret;
             selection_start_ = drag_anchor_;
             selection_end_ = caret;
@@ -2505,42 +3194,73 @@ private:
     }
 
     bool should_show_caret() const {
-        // 1.2s full cycle, 0.6s on / 0.6s off.
-        return std::fmod(input_.time_seconds, 1.2) < 0.6;
+        return true;
+    }
+
+    void draw_static_input_content(const Rect& input_rect, std::string_view text, float font_size, bool align_right,
+                                   float padding, const Color& text_color) {
+        const Rect content_clip{
+            input_rect.x + padding,
+            input_rect.y + 2.0f,
+            std::max(0.0f, input_rect.w - padding * 2.0f),
+            std::max(0.0f, input_rect.h - 4.0f),
+        };
+        const float text_w = approx_text_width_until(text, text.size(), font_size);
+        float origin_x = content_clip.x;
+        if (align_right) {
+            origin_x += content_clip.w - text_w;
+        }
+        add_text(text,
+                 Rect{origin_x, input_rect.y, std::max(content_clip.w, text_w), input_rect.h},
+                 text_color, font_size, TextAlign::Left, &content_clip);
     }
 
     void draw_text_input_content(const Rect& input_rect, float font_size, bool align_right, float padding,
                                  const Color& text_color, const Color& selection_color) {
         const std::string_view text_view = std::string_view(input_buffer_);
-        const float char_w = approx_char_width(font_size);
         const float origin_x =
-            text_origin_x(input_rect, font_size, align_right, padding, text_view.size());
+            resolve_input_origin_x(input_rect, font_size, align_right, padding, text_view, caret_pos_, true);
+        const float text_w = approx_text_width_until(text_view, text_view.size(), font_size);
+        const Rect content_clip{
+            input_rect.x + padding,
+            input_rect.y + 2.0f,
+            std::max(0.0f, input_rect.w - padding * 2.0f),
+            std::max(0.0f, input_rect.h - 4.0f),
+        };
 
         if (has_selection()) {
-            const std::size_t sel_l = selection_left();
-            const std::size_t sel_r = selection_right();
+            const float sel_l = approx_text_width_until(text_view, selection_left(), font_size);
+            const float sel_r = approx_text_width_until(text_view, selection_right(), font_size);
+            const float selection_pad_x = std::max(1.0f, font_size * 0.08f);
             const Rect selection_rect{
-                origin_x + static_cast<float>(sel_l) * char_w,
-                input_rect.y + 4.0f,
-                static_cast<float>(sel_r - sel_l) * char_w,
-                std::max(2.0f, input_rect.h - 8.0f),
+                origin_x + sel_l - selection_pad_x,
+                input_rect.y + 2.0f,
+                std::max(0.0f, sel_r - sel_l) + selection_pad_x * 2.0f,
+                std::max(2.0f, input_rect.h - 4.0f),
             };
             if (selection_rect.w > 0.0f) {
-                add_filled_rect(selection_rect, selection_color, 2.0f);
+                Rect clipped{};
+                if (intersect_rects(selection_rect, content_clip, clipped)) {
+                    add_filled_rect(clipped, selection_color, 2.0f);
+                }
             }
         }
 
-        add_text(text_view, Rect{origin_x, input_rect.y, input_rect.w - padding * 2.0f, input_rect.h}, text_color,
-                 font_size, TextAlign::Left);
+        add_text(text_view, Rect{origin_x, input_rect.y, std::max(content_clip.w, text_w), input_rect.h},
+                 text_color, font_size, TextAlign::Left, &content_clip);
 
         if (should_show_caret()) {
+            const float caret_x = approx_text_width_until(text_view, caret_pos_, font_size);
             const Rect caret_rect{
-                origin_x + static_cast<float>(caret_pos_) * char_w,
+                origin_x + caret_x,
                 input_rect.y + 4.0f,
                 1.3f,
                 std::max(2.0f, input_rect.h - 8.0f),
             };
-            add_filled_rect(caret_rect, text_color, 0.0f);
+            Rect clipped{};
+            if (intersect_rects(caret_rect, content_clip, clipped)) {
+                add_filled_rect(clipped, text_color, 0.0f);
+            }
         }
     }
 
@@ -2749,7 +3469,28 @@ private:
     std::size_t selection_start_{0u};
     std::size_t selection_end_{0u};
     std::size_t drag_anchor_{0u};
+    float input_scroll_x_{0.0f};
     bool drag_selecting_{false};
+#if defined(_WIN32) && defined(EUI_ENABLE_GLFW_OPENGL_BACKEND)
+    mutable HDC text_measure_hdc_{nullptr};
+    mutable std::unordered_map<std::string, HFONT> text_measure_fonts_{};
+#endif
+    TextMeasureBackend text_measure_backend_{TextMeasureBackend::Approx};
+    std::string text_measure_font_family_{"Segoe UI"};
+    int text_measure_font_weight_{600};
+    std::string text_measure_font_file_{};
+    std::string text_measure_icon_font_family_{"Font Awesome 7 Free Solid"};
+    std::string text_measure_icon_font_file_{};
+    bool text_measure_enable_icon_fallback_{true};
+#if EUI_ENABLE_STB_TRUETYPE
+    struct StbMeasureFont {
+        std::vector<unsigned char> data{};
+        stbtt_fontinfo info{};
+        float scale{0.0f};
+        bool valid{false};
+    };
+    mutable std::unordered_map<std::string, StbMeasureFont> stb_measure_fonts_{};
+#endif
     bool repaint_requested_{false};
     bool clipboard_write_pending_{false};
     std::string clipboard_write_text_{};
@@ -2764,6 +3505,12 @@ private:
 namespace demo {
 
 struct AppOptions {
+    enum class TextBackend {
+        Auto,
+        Stb,
+        Win32,
+    };
+
     int width{1150};
     int height{820};
     const char* title{"EUI Demo"};
@@ -2774,9 +3521,10 @@ struct AppOptions {
     const char* text_font_family{"Segoe UI"};
     int text_font_weight{600};
     const char* text_font_file{nullptr};
-    const char* icon_font_family{"Segoe MDL2 Assets"};
-    const char* icon_font_file{nullptr};
+    const char* icon_font_family{"Font Awesome 7 Free Solid"};
+    const char* icon_font_file{"include/Font Awesome 7 Free-Solid-900.otf"};
     bool enable_icon_font_fallback{true};
+    TextBackend text_backend{TextBackend::Auto};
 };
 
 struct FrameContext {
@@ -2808,22 +3556,22 @@ using TextureId = unsigned int;
 struct RuntimeState {
     std::string text_input{};
     double scroll_y_accum{0.0};
+    bool pending_backspace{false};
+    bool pending_delete{false};
+    bool pending_enter{false};
+    bool pending_escape{false};
+    bool pending_left{false};
+    bool pending_right{false};
+    bool pending_up{false};
+    bool pending_down{false};
+    bool pending_home{false};
+    bool pending_end{false};
     bool prev_left_mouse{false};
     bool prev_right_mouse{false};
-    bool prev_backspace{false};
-    bool prev_delete{false};
-    bool prev_enter{false};
-    bool prev_escape{false};
-    bool prev_left_key{false};
-    bool prev_right_key{false};
-    bool prev_home_key{false};
-    bool prev_end_key{false};
     bool prev_a_key{false};
     bool prev_c_key{false};
     bool prev_v_key{false};
     bool prev_x_key{false};
-    bool prev_left_shift{false};
-    bool prev_right_shift{false};
     double prev_mouse_x{0.0};
     double prev_mouse_y{0.0};
     bool has_prev_mouse{false};
@@ -2867,6 +3615,52 @@ inline void text_input_callback(GLFWwindow* window, unsigned int codepoint) {
         state->text_input.push_back(static_cast<char>(0x80u | ((codepoint >> 12u) & 0x3Fu)));
         state->text_input.push_back(static_cast<char>(0x80u | ((codepoint >> 6u) & 0x3Fu)));
         state->text_input.push_back(static_cast<char>(0x80u | (codepoint & 0x3Fu)));
+    }
+}
+
+inline void key_input_callback(GLFWwindow* window, int key, int /*scancode*/, int action, int /*mods*/) {
+    if (action != GLFW_PRESS && action != GLFW_REPEAT) {
+        return;
+    }
+    RuntimeState* state = static_cast<RuntimeState*>(glfwGetWindowUserPointer(window));
+    if (state == nullptr) {
+        return;
+    }
+
+    switch (key) {
+        case GLFW_KEY_BACKSPACE:
+            state->pending_backspace = true;
+            break;
+        case GLFW_KEY_DELETE:
+            state->pending_delete = true;
+            break;
+        case GLFW_KEY_ENTER:
+        case GLFW_KEY_KP_ENTER:
+            state->pending_enter = true;
+            break;
+        case GLFW_KEY_ESCAPE:
+            state->pending_escape = true;
+            break;
+        case GLFW_KEY_LEFT:
+            state->pending_left = true;
+            break;
+        case GLFW_KEY_RIGHT:
+            state->pending_right = true;
+            break;
+        case GLFW_KEY_UP:
+            state->pending_up = true;
+            break;
+        case GLFW_KEY_DOWN:
+            state->pending_down = true;
+            break;
+        case GLFW_KEY_HOME:
+            state->pending_home = true;
+            break;
+        case GLFW_KEY_END:
+            state->pending_end = true;
+            break;
+        default:
+            break;
     }
 }
 
@@ -2927,6 +3721,17 @@ inline bool command_payload_equal(const DrawCommand& lhs, const DrawCommand& rhs
     (void)lhs_arena;
     (void)rhs_arena;
     return lhs.hash == rhs.hash;
+}
+
+inline Rect command_visible_rect(const DrawCommand& cmd) {
+    if (!cmd.has_clip) {
+        return cmd.rect;
+    }
+    Rect visible{};
+    if (!rect_intersection(cmd.rect, cmd.clip_rect, visible)) {
+        return Rect{};
+    }
+    return visible;
 }
 
 inline Rect expanded_and_clamped(const Rect& rect, int width, int height, float expand_px = 2.0f) {
@@ -3040,10 +3845,10 @@ inline bool compute_dirty_regions(const std::vector<DrawCommand>& commands,
         }
 
         if (has_curr) {
-            append_dirty_rect(commands[i].rect, width, height, out_regions);
+            append_dirty_rect(command_visible_rect(commands[i]), width, height, out_regions);
         }
         if (has_prev) {
-            append_dirty_rect(runtime.prev_commands[i].rect, width, height, out_regions);
+            append_dirty_rect(command_visible_rect(runtime.prev_commands[i]), width, height, out_regions);
         }
     }
 
@@ -3146,6 +3951,98 @@ inline void draw_cache_texture(const RuntimeState& runtime, int width, int heigh
     glDisable(GL_TEXTURE_2D);
 }
 
+inline bool font_file_exists(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+    std::ifstream ifs(path, std::ios::binary);
+    return static_cast<bool>(ifs);
+}
+
+inline std::string resolve_bundled_icon_font_file() {
+    static constexpr const char* kBundledFont = "Font Awesome 7 Free-Solid-900.otf";
+    static constexpr const char* kCandidates[] = {
+        "include/Font Awesome 7 Free-Solid-900.otf",
+        "./include/Font Awesome 7 Free-Solid-900.otf",
+        "../include/Font Awesome 7 Free-Solid-900.otf",
+        "../../include/Font Awesome 7 Free-Solid-900.otf",
+    };
+    for (const char* candidate : kCandidates) {
+        if (candidate != nullptr && font_file_exists(candidate)) {
+            return std::string(candidate);
+        }
+    }
+    (void)kBundledFont;
+    return {};
+}
+
+inline std::string resolve_icon_font_file_path(const char* explicit_file) {
+    if (explicit_file != nullptr && explicit_file[0] != '\0') {
+        const std::string explicit_path = explicit_file;
+        if (font_file_exists(explicit_path)) {
+            return explicit_path;
+        }
+    }
+    const std::string bundled = resolve_bundled_icon_font_file();
+    if (!bundled.empty()) {
+        return bundled;
+    }
+    if (explicit_file != nullptr && explicit_file[0] != '\0') {
+        return std::string(explicit_file);
+    }
+    return {};
+}
+
+#ifndef _WIN32
+inline bool utf8_next(std::string_view text, std::size_t& index, std::uint32_t& codepoint) {
+    if (index >= text.size()) {
+        return false;
+    }
+    const unsigned char lead = static_cast<unsigned char>(text[index]);
+    if (lead < 0x80u) {
+        codepoint = lead;
+        index += 1u;
+        return true;
+    }
+    if ((lead >> 5u) == 0x6u && index + 1u < text.size()) {
+        const unsigned char b1 = static_cast<unsigned char>(text[index + 1u]);
+        if ((b1 & 0xC0u) == 0x80u) {
+            codepoint = (static_cast<std::uint32_t>(lead & 0x1Fu) << 6u) |
+                        static_cast<std::uint32_t>(b1 & 0x3Fu);
+            index += 2u;
+            return true;
+        }
+    }
+    if ((lead >> 4u) == 0xEu && index + 2u < text.size()) {
+        const unsigned char b1 = static_cast<unsigned char>(text[index + 1u]);
+        const unsigned char b2 = static_cast<unsigned char>(text[index + 2u]);
+        if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u) {
+            codepoint = (static_cast<std::uint32_t>(lead & 0x0Fu) << 12u) |
+                        (static_cast<std::uint32_t>(b1 & 0x3Fu) << 6u) |
+                        static_cast<std::uint32_t>(b2 & 0x3Fu);
+            index += 3u;
+            return true;
+        }
+    }
+    if ((lead >> 3u) == 0x1Eu && index + 3u < text.size()) {
+        const unsigned char b1 = static_cast<unsigned char>(text[index + 1u]);
+        const unsigned char b2 = static_cast<unsigned char>(text[index + 2u]);
+        const unsigned char b3 = static_cast<unsigned char>(text[index + 3u]);
+        if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u && (b3 & 0xC0u) == 0x80u) {
+            codepoint = (static_cast<std::uint32_t>(lead & 0x07u) << 18u) |
+                        (static_cast<std::uint32_t>(b1 & 0x3Fu) << 12u) |
+                        (static_cast<std::uint32_t>(b2 & 0x3Fu) << 6u) |
+                        static_cast<std::uint32_t>(b3 & 0x3Fu);
+            index += 4u;
+            return true;
+        }
+    }
+    codepoint = static_cast<std::uint32_t>(lead);
+    index += 1u;
+    return true;
+}
+#endif
+
 #ifdef _WIN32
 inline std::wstring utf8_to_wide(std::string_view text) {
     if (text.empty()) {
@@ -3221,9 +4118,9 @@ public:
         : text_family_(utf8_to_wide(options.text_font_family != nullptr ? options.text_font_family : "Segoe UI")),
           text_font_weight_(std::clamp(options.text_font_weight, 100, 900)),
           icon_family_(utf8_to_wide(options.icon_font_family != nullptr ? options.icon_font_family
-                                                                       : "Segoe MDL2 Assets")),
+                                                                       : "Font Awesome 7 Free Solid")),
           text_font_file_(utf8_to_wide(options.text_font_file != nullptr ? options.text_font_file : "")),
-          icon_font_file_(utf8_to_wide(options.icon_font_file != nullptr ? options.icon_font_file : "")),
+          icon_font_file_(utf8_to_wide(resolve_icon_font_file_path(options.icon_font_file))),
           enable_icon_fallback_(options.enable_icon_font_fallback) {}
 
     ~Win32FontRenderer() {
@@ -3271,12 +4168,13 @@ public:
         ensure_private_fonts_loaded();
 
         // Outline path appears visually smaller than legacy bitmap; lift render px for parity.
-        const int font_px = std::max(8, static_cast<int>(std::round(cmd.font_size * 1.2f)));
-        FontInstance* text_font = ensure_font(false, font_px, hdc);
+        const int text_font_px = std::max(8, static_cast<int>(std::round(cmd.font_size * 1.2f)));
+        const int icon_font_px = std::max(8, static_cast<int>(std::round(text_font_px * k_icon_visual_scale)));
+        FontInstance* text_font = ensure_font(false, text_font_px, hdc);
         if (text_font == nullptr) {
             return false;
         }
-        FontInstance* icon_font = enable_icon_fallback_ ? ensure_font(true, font_px, hdc) : nullptr;
+        FontInstance* icon_font = enable_icon_fallback_ ? ensure_font(true, icon_font_px, hdc) : nullptr;
 
         std::vector<GlyphData> glyphs;
         glyphs.reserve(text.size());
@@ -3479,6 +4377,8 @@ private:
             };
 
             add_unique(icon_family_);
+            add_unique(L"Font Awesome 7 Free Solid");
+            add_unique(L"Font Awesome 7 Free");
             add_unique(L"Segoe Fluent Icons");
             add_unique(L"Segoe MDL2 Assets");
             add_unique(L"Segoe UI Symbol");
@@ -3638,6 +4538,761 @@ private:
     mutable bool private_fonts_loaded_{false};
     mutable std::unordered_map<std::string, FontInstance> fonts_{};
     mutable std::vector<std::wstring> loaded_private_fonts_{};
+};
+#endif
+
+#if EUI_ENABLE_STB_TRUETYPE
+class StbFontRenderer {
+public:
+    static std::string resolve_font_path_for_measure(const char* explicit_file, const char* family, bool icon_font) {
+        return resolve_font_path(explicit_file, family, icon_font);
+    }
+
+    explicit StbFontRenderer(const AppOptions& options)
+        : text_font_path_(resolve_font_path(options.text_font_file, options.text_font_family, false)),
+          icon_font_path_(resolve_font_path(options.icon_font_file, options.icon_font_family, true)),
+          enable_icon_fallback_(options.enable_icon_font_fallback) {}
+
+    void release_gl_resources() const {
+        for (auto& pair : faces_) {
+            FontFace& face = pair.second;
+            for (AtlasPage& page : face.atlas_pages) {
+                if (page.texture_id != 0u) {
+                    glDeleteTextures(1, &page.texture_id);
+                    page.texture_id = 0u;
+                }
+            }
+            face.atlas_pages.clear();
+            face.glyphs.clear();
+            face.data_blob.reset();
+        }
+        faces_.clear();
+        font_blob_cache_.clear();
+        face_use_tick_ = 1u;
+    }
+
+    bool draw_text(const DrawCommand& cmd, std::string_view text) const {
+        if (text.empty()) {
+            return true;
+        }
+
+        const int text_font_px = std::max(8, static_cast<int>(std::round(cmd.font_size * 1.20f)));
+        const int icon_font_px = std::max(8, static_cast<int>(std::round(text_font_px * k_icon_visual_scale)));
+        FontFace* text_face = ensure_face(false, text_font_px);
+        FontFace* icon_face = nullptr;
+        auto ensure_icon_face = [&]() -> FontFace* {
+            if (!enable_icon_fallback_) {
+                return nullptr;
+            }
+            if (icon_face == nullptr) {
+                icon_face = ensure_face(true, icon_font_px);
+            }
+            return icon_face;
+        };
+        if (text_face == nullptr) {
+            if (!enable_icon_fallback_ || ensure_icon_face() == nullptr) {
+                return false;
+            }
+        }
+
+        struct DrawGlyph {
+            const GlyphData* glyph{nullptr};
+            float pen_x{0.0f};
+        };
+
+        std::vector<DrawGlyph> draw_glyphs;
+        draw_glyphs.reserve(text.size());
+        float width = 0.0f;
+        float max_above = 0.0f;
+        float max_below = 0.0f;
+
+        auto fallback_glyph = [&](FontFace* face) -> const GlyphData* {
+            if (face == nullptr) {
+                return nullptr;
+            }
+            GlyphData* fallback = ensure_glyph(face, static_cast<std::uint32_t>('?'));
+            if (fallback != nullptr && fallback->valid) {
+                return fallback;
+            }
+            return nullptr;
+        };
+
+        auto pick_glyph = [&](std::uint32_t cp) -> const GlyphData* {
+            auto try_face = [&](FontFace* face) -> const GlyphData* {
+                if (face == nullptr) {
+                    return nullptr;
+                }
+                GlyphData* glyph = ensure_glyph(face, cp);
+                if (glyph != nullptr && glyph->valid) {
+                    return glyph;
+                }
+                return nullptr;
+            };
+
+            const bool private_use = cp >= 0xE000u && cp <= 0xF8FFu;
+            if (private_use && enable_icon_fallback_) {
+                if (const GlyphData* icon = try_face(ensure_icon_face())) {
+                    return icon;
+                }
+                return fallback_glyph(text_face);
+            }
+            if (const GlyphData* regular = try_face(text_face)) {
+                return regular;
+            }
+            if (enable_icon_fallback_) {
+                if (const GlyphData* icon = try_face(ensure_icon_face())) {
+                    return icon;
+                }
+            }
+            if (const GlyphData* fallback = fallback_glyph(text_face)) {
+                return fallback;
+            }
+            return fallback_glyph(ensure_icon_face());
+        };
+
+        std::size_t index = 0u;
+        while (index < text.size()) {
+            std::uint32_t cp = 0u;
+            if (!utf8_next(text, index, cp)) {
+                break;
+            }
+            const GlyphData* glyph = pick_glyph(cp);
+            if (glyph == nullptr) {
+                continue;
+            }
+
+            draw_glyphs.push_back(DrawGlyph{glyph, width});
+            width += std::max(0.0f, glyph->advance);
+            max_above = std::max(max_above, std::max(0.0f, -glyph->yoff));
+            max_below = std::max(max_below, std::max(0.0f, glyph->h + glyph->yoff));
+        }
+
+        if (draw_glyphs.empty()) {
+            return false;
+        }
+
+        float x = cmd.rect.x;
+        if (cmd.align == TextAlign::Center) {
+            x += std::max(0.0f, (cmd.rect.w - width) * 0.5f);
+        } else if (cmd.align == TextAlign::Right) {
+            x += std::max(0.0f, cmd.rect.w - width);
+        }
+
+        if (max_above + max_below < 1.0f) {
+            if (text_face != nullptr && text_face->line_height > 1.0f) {
+                max_above = std::max(max_above, text_face->ascent);
+                max_below = std::max(max_below, text_face->line_height - text_face->ascent);
+            } else if (icon_face != nullptr && icon_face->line_height > 1.0f) {
+                max_above = std::max(max_above, icon_face->ascent);
+                max_below = std::max(max_below, icon_face->line_height - icon_face->ascent);
+            } else {
+                max_above = std::max(max_above, cmd.font_size * 0.72f);
+                max_below = std::max(max_below, cmd.font_size * 0.28f);
+            }
+        }
+
+        const float text_h = std::max(1.0f, max_above + max_below);
+        const float baseline_y = cmd.rect.y + std::max(0.0f, (cmd.rect.h - text_h) * 0.5f) + max_above;
+
+        glEnable(GL_TEXTURE_2D);
+        glColor4f(cmd.color.r, cmd.color.g, cmd.color.b, cmd.color.a);
+        unsigned int bound_texture = 0u;
+        for (const DrawGlyph& draw : draw_glyphs) {
+            const GlyphData& glyph = *draw.glyph;
+            if (!glyph.has_bitmap || glyph.texture_id == 0u || glyph.w <= 0.0f || glyph.h <= 0.0f) {
+                continue;
+            }
+            const float x0 = x + draw.pen_x + glyph.xoff;
+            const float y0 = baseline_y + glyph.yoff;
+            const float x1 = x0 + glyph.w;
+            const float y1 = y0 + glyph.h;
+
+            if (bound_texture != glyph.texture_id) {
+                glBindTexture(GL_TEXTURE_2D, glyph.texture_id);
+                bound_texture = glyph.texture_id;
+            }
+            glBegin(GL_QUADS);
+            glTexCoord2f(glyph.u0, glyph.v0);
+            glVertex2f(x0, y0);
+            glTexCoord2f(glyph.u1, glyph.v0);
+            glVertex2f(x1, y0);
+            glTexCoord2f(glyph.u1, glyph.v1);
+            glVertex2f(x1, y1);
+            glTexCoord2f(glyph.u0, glyph.v1);
+            glVertex2f(x0, y1);
+            glEnd();
+        }
+        if (bound_texture != 0u) {
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
+        glDisable(GL_TEXTURE_2D);
+        return true;
+    }
+
+private:
+    static constexpr int k_atlas_padding = 1;
+    static constexpr int k_max_atlas_pages = 3;
+    static constexpr int k_tiny_atlas_size = 256;
+    static constexpr int k_small_atlas_size = 512;
+    static constexpr int k_large_atlas_size = 1024;
+    static constexpr std::size_t k_max_face_cache = 20u;
+
+    struct AtlasSlot {
+        bool occupied{false};
+        std::uint32_t codepoint{0u};
+        std::uint64_t last_used{0u};
+    };
+
+    struct AtlasPage {
+        unsigned int texture_id{0u};
+        int width{0};
+        int height{0};
+        int cell_size{0};
+        int columns{0};
+        int rows{0};
+        std::vector<AtlasSlot> slots{};
+    };
+
+    struct GlyphData {
+        unsigned int texture_id{0u};
+        std::uint16_t page_index{0u};
+        std::uint16_t slot_index{0u};
+        float advance{0.0f};
+        float xoff{0.0f};
+        float yoff{0.0f};
+        float w{0.0f};
+        float h{0.0f};
+        float u0{0.0f};
+        float v0{0.0f};
+        float u1{0.0f};
+        float v1{0.0f};
+        bool has_bitmap{false};
+        bool valid{false};
+    };
+
+    struct FontFace {
+        std::shared_ptr<std::vector<unsigned char>> data_blob{};
+        stbtt_fontinfo info{};
+        float scale{0.0f};
+        float ascent{0.0f};
+        float line_height{0.0f};
+        int atlas_size{k_small_atlas_size};
+        int cell_size{64};
+        int max_pages{k_max_atlas_pages};
+        std::uint64_t lru_tick{1u};
+        std::uint64_t last_used{0u};
+        bool valid{false};
+        std::unordered_map<std::uint32_t, GlyphData> glyphs{};
+        std::vector<AtlasPage> atlas_pages{};
+    };
+
+    struct SlotHandle {
+        AtlasPage* page{nullptr};
+        std::size_t page_index{0u};
+        std::size_t slot_index{0u};
+        int x{0};
+        int y{0};
+        bool valid{false};
+    };
+
+    static int next_power_of_two(int value) {
+        int result = 1;
+        while (result < value && result < 4096) {
+            result <<= 1;
+        }
+        return std::max(1, result);
+    }
+
+    static int quantize_font_px(int px) {
+        int clamped = std::max(8, px);
+        if (clamped <= 32) {
+            clamped = ((clamped + 1) / 2) * 2;
+        } else if (clamped <= 72) {
+            clamped = ((clamped + 2) / 4) * 4;
+        } else {
+            clamped = ((clamped + 4) / 8) * 8;
+        }
+        return std::clamp(clamped, 8, 200);
+    }
+
+    static bool file_exists(const std::string& path) {
+        if (path.empty()) {
+            return false;
+        }
+        std::ifstream ifs(path, std::ios::binary);
+        return static_cast<bool>(ifs);
+    }
+
+    static std::vector<unsigned char> read_file(const std::string& path) {
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs) {
+            return {};
+        }
+        ifs.seekg(0, std::ios::end);
+        const std::streamoff size = ifs.tellg();
+        if (size <= 0) {
+            return {};
+        }
+        ifs.seekg(0, std::ios::beg);
+        std::vector<unsigned char> bytes(static_cast<std::size_t>(size));
+        ifs.read(reinterpret_cast<char*>(bytes.data()), size);
+        if (!ifs) {
+            return {};
+        }
+        return bytes;
+    }
+
+    std::shared_ptr<std::vector<unsigned char>> load_font_blob(const std::string& path) const {
+        if (path.empty()) {
+            return {};
+        }
+        auto it = font_blob_cache_.find(path);
+        if (it != font_blob_cache_.end()) {
+            return it->second;
+        }
+        auto data = std::make_shared<std::vector<unsigned char>>(read_file(path));
+        if (data->empty()) {
+            return {};
+        }
+        font_blob_cache_[path] = data;
+        return data;
+    }
+
+    static void release_face_gl_resources(FontFace& face) {
+        for (AtlasPage& page : face.atlas_pages) {
+            if (page.texture_id != 0u) {
+                glDeleteTextures(1, &page.texture_id);
+                page.texture_id = 0u;
+            }
+        }
+        face.atlas_pages.clear();
+        face.glyphs.clear();
+        face.data_blob.reset();
+    }
+
+    void prune_face_cache_if_needed(const std::string& preserve_key) const {
+        while (faces_.size() > k_max_face_cache) {
+            auto victim = faces_.end();
+            for (auto it = faces_.begin(); it != faces_.end(); ++it) {
+                if (it->first == preserve_key) {
+                    continue;
+                }
+                if (victim == faces_.end() || it->second.last_used < victim->second.last_used) {
+                    victim = it;
+                }
+            }
+            if (victim == faces_.end()) {
+                break;
+            }
+            release_face_gl_resources(victim->second);
+            faces_.erase(victim);
+        }
+    }
+
+    static std::string to_lower_ascii(std::string_view text) {
+        std::string out;
+        out.reserve(text.size());
+        for (char ch : text) {
+            out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+        return out;
+    }
+
+    static std::string join_path(const std::string& base, const char* file_name) {
+        if (base.empty() || file_name == nullptr || *file_name == '\0') {
+            return {};
+        }
+        const char last = base.back();
+        if (last == '/' || last == '\\') {
+            return base + file_name;
+        }
+#ifdef _WIN32
+        return base + "\\" + file_name;
+#else
+        return base + "/" + file_name;
+#endif
+    }
+
+    static std::string resolve_font_path(const char* explicit_file, const char* family, bool icon_font) {
+        if (icon_font) {
+            const std::string icon_path = resolve_icon_font_file_path(explicit_file);
+            if (!icon_path.empty() && file_exists(icon_path)) {
+                return icon_path;
+            }
+        } else if (explicit_file != nullptr && explicit_file[0] != '\0') {
+            const std::string explicit_path = explicit_file;
+            if (file_exists(explicit_path)) {
+                return explicit_path;
+            }
+        }
+
+        std::vector<std::string> candidates;
+        const std::string family_lower = to_lower_ascii(family != nullptr ? std::string_view(family) : "");
+
+#ifdef _WIN32
+        std::string windows_dir = "C:\\Windows";
+#if defined(_MSC_VER)
+        char* env_value = nullptr;
+        std::size_t env_len = 0u;
+        if (_dupenv_s(&env_value, &env_len, "WINDIR") == 0 && env_value != nullptr) {
+            if (env_value[0] != '\0') {
+                windows_dir = env_value;
+            }
+        }
+        std::free(env_value);
+#else
+        if (const char* env = std::getenv("WINDIR")) {
+            if (env[0] != '\0') {
+                windows_dir = env;
+            }
+        }
+#endif
+        const std::string fonts_dir = join_path(windows_dir, "Fonts");
+        auto add_win = [&](const char* file_name) {
+            const std::string full = join_path(fonts_dir, file_name);
+            if (!full.empty()) {
+                candidates.push_back(full);
+            }
+        };
+
+        if (icon_font) {
+            if (family_lower.find("fluent") != std::string::npos) {
+                add_win("segfluenticons.ttf");
+            }
+            if (family_lower.find("mdl2") != std::string::npos) {
+                add_win("segmdl2.ttf");
+            }
+            if (family_lower.find("symbol") != std::string::npos) {
+                add_win("seguisym.ttf");
+            }
+            add_win("segmdl2.ttf");
+            add_win("segfluenticons.ttf");
+            add_win("seguisym.ttf");
+        } else {
+            if (family_lower.find("segoe") != std::string::npos) {
+                add_win("segoeui.ttf");
+            }
+            if (family_lower.find("arial") != std::string::npos) {
+                add_win("arial.ttf");
+            }
+            add_win("segoeui.ttf");
+            add_win("arial.ttf");
+        }
+#else
+        auto add_unix = [&](const char* path) {
+            candidates.emplace_back(path);
+        };
+
+        if (icon_font) {
+            if (family_lower.find("emoji") != std::string::npos) {
+                add_unix("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf");
+            }
+            add_unix("/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf");
+            add_unix("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf");
+            add_unix("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+        } else {
+            if (family_lower.find("noto") != std::string::npos) {
+                add_unix("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf");
+            }
+            add_unix("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+            add_unix("/usr/share/fonts/dejavu/DejaVuSans.ttf");
+            add_unix("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf");
+        }
+#endif
+
+        for (const std::string& path : candidates) {
+            if (file_exists(path)) {
+                return path;
+            }
+        }
+        return {};
+    }
+
+    static std::size_t slot_count_for(const AtlasPage& page) {
+        return static_cast<std::size_t>(std::max(0, page.columns) * std::max(0, page.rows));
+    }
+
+    bool create_atlas_page(FontFace* face) const {
+        if (face == nullptr || static_cast<int>(face->atlas_pages.size()) >= face->max_pages) {
+            return false;
+        }
+
+        AtlasPage page{};
+        page.width = std::max(128, face->atlas_size);
+        page.height = std::max(128, face->atlas_size);
+        page.cell_size = std::max(8, face->cell_size);
+        page.columns = std::max(1, page.width / page.cell_size);
+        page.rows = std::max(1, page.height / page.cell_size);
+        page.slots.assign(slot_count_for(page), AtlasSlot{});
+
+        glGenTextures(1, &page.texture_id);
+        if (page.texture_id == 0u) {
+            return false;
+        }
+
+        GLint prev_unpack = 4;
+        glGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_unpack);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glBindTexture(GL_TEXTURE_2D, page.texture_id);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        std::vector<unsigned char> zero(static_cast<std::size_t>(page.width * page.height), 0u);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, page.width, page.height, 0, GL_ALPHA, GL_UNSIGNED_BYTE,
+                     zero.data());
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, prev_unpack);
+
+        face->atlas_pages.push_back(std::move(page));
+        return true;
+    }
+
+    void touch_slot(FontFace* face, const GlyphData& glyph) const {
+        if (face == nullptr || !glyph.has_bitmap) {
+            return;
+        }
+        const std::size_t page_index = static_cast<std::size_t>(glyph.page_index);
+        if (page_index >= face->atlas_pages.size()) {
+            return;
+        }
+        AtlasPage& page = face->atlas_pages[page_index];
+        const std::size_t slot_index = static_cast<std::size_t>(glyph.slot_index);
+        if (slot_index >= page.slots.size()) {
+            return;
+        }
+        AtlasSlot& slot = page.slots[slot_index];
+        if (!slot.occupied) {
+            return;
+        }
+        slot.last_used = ++face->lru_tick;
+    }
+
+    SlotHandle acquire_slot(FontFace* face, std::uint32_t cp) const {
+        if (face == nullptr) {
+            return {};
+        }
+
+        auto make_handle = [&](AtlasPage& page, std::size_t page_index, std::size_t slot_index) -> SlotHandle {
+            AtlasSlot& slot = page.slots[slot_index];
+            slot.occupied = true;
+            slot.codepoint = cp;
+            slot.last_used = ++face->lru_tick;
+            const int col = static_cast<int>(slot_index % static_cast<std::size_t>(std::max(1, page.columns)));
+            const int row = static_cast<int>(slot_index / static_cast<std::size_t>(std::max(1, page.columns)));
+            return SlotHandle{
+                &page,
+                page_index,
+                slot_index,
+                col * page.cell_size,
+                row * page.cell_size,
+                true,
+            };
+        };
+
+        for (std::size_t page_index = 0; page_index < face->atlas_pages.size(); ++page_index) {
+            AtlasPage& page = face->atlas_pages[page_index];
+            for (std::size_t slot_index = 0; slot_index < page.slots.size(); ++slot_index) {
+                if (!page.slots[slot_index].occupied) {
+                    return make_handle(page, page_index, slot_index);
+                }
+            }
+        }
+
+        if (static_cast<int>(face->atlas_pages.size()) < face->max_pages && create_atlas_page(face)) {
+            AtlasPage& page = face->atlas_pages.back();
+            if (!page.slots.empty()) {
+                return make_handle(page, face->atlas_pages.size() - 1u, 0u);
+            }
+        }
+
+        std::uint64_t oldest_tick = std::numeric_limits<std::uint64_t>::max();
+        std::size_t oldest_page_index = 0u;
+        std::size_t oldest_slot_index = 0u;
+        bool found = false;
+        for (std::size_t page_index = 0; page_index < face->atlas_pages.size(); ++page_index) {
+            AtlasPage& page = face->atlas_pages[page_index];
+            for (std::size_t slot_index = 0; slot_index < page.slots.size(); ++slot_index) {
+                const AtlasSlot& slot = page.slots[slot_index];
+                if (!slot.occupied) {
+                    continue;
+                }
+                if (!found || slot.last_used < oldest_tick) {
+                    found = true;
+                    oldest_tick = slot.last_used;
+                    oldest_page_index = page_index;
+                    oldest_slot_index = slot_index;
+                }
+            }
+        }
+        if (!found) {
+            return {};
+        }
+
+        AtlasPage& page = face->atlas_pages[oldest_page_index];
+        AtlasSlot& slot = page.slots[oldest_slot_index];
+        if (slot.occupied) {
+            face->glyphs.erase(slot.codepoint);
+        }
+        return make_handle(page, oldest_page_index, oldest_slot_index);
+    }
+
+    FontFace* ensure_face(bool icon_font, int px) const {
+        const int quantized_px = quantize_font_px(px);
+        const std::string key = std::string(icon_font ? "icon:" : "text:") + std::to_string(quantized_px);
+        auto it = faces_.find(key);
+        if (it != faces_.end()) {
+            it->second.last_used = ++face_use_tick_;
+            return it->second.valid ? &it->second : nullptr;
+        }
+
+        FontFace face{};
+        const std::string& path = icon_font ? icon_font_path_ : text_font_path_;
+        face.data_blob = load_font_blob(path);
+        if (face.data_blob != nullptr && !face.data_blob->empty()) {
+            const int offset = stbtt_GetFontOffsetForIndex(face.data_blob->data(), 0);
+            if (offset >= 0 && stbtt_InitFont(&face.info, face.data_blob->data(), offset) != 0) {
+                face.scale = stbtt_ScaleForPixelHeight(&face.info, static_cast<float>(quantized_px));
+                int ascent = 0;
+                int descent = 0;
+                int line_gap = 0;
+                stbtt_GetFontVMetrics(&face.info, &ascent, &descent, &line_gap);
+                face.ascent = static_cast<float>(ascent) * face.scale;
+                face.line_height = static_cast<float>(ascent - descent + line_gap) * face.scale;
+                face.cell_size = std::clamp(next_power_of_two(std::max(20, quantized_px + quantized_px / 2)), 24, 128);
+                if (face.cell_size <= 32) {
+                    face.atlas_size = k_tiny_atlas_size;
+                    face.max_pages = 2;
+                } else if (face.cell_size <= 64) {
+                    face.atlas_size = k_small_atlas_size;
+                    face.max_pages = 2;
+                } else {
+                    face.atlas_size = k_large_atlas_size;
+                    face.max_pages = k_max_atlas_pages;
+                }
+                face.lru_tick = 1u;
+                face.last_used = ++face_use_tick_;
+                face.valid = face.scale > 0.0f;
+            }
+        }
+
+        auto [inserted, _] = faces_.emplace(key, std::move(face));
+        return inserted->second.valid ? &inserted->second : nullptr;
+    }
+
+    GlyphData* ensure_glyph(FontFace* face, std::uint32_t cp) const {
+        if (face == nullptr) {
+            return nullptr;
+        }
+        auto it = face->glyphs.find(cp);
+        if (it != face->glyphs.end()) {
+            touch_slot(face, it->second);
+            return &it->second;
+        }
+
+        GlyphData glyph{};
+        const int glyph_index = stbtt_FindGlyphIndex(&face->info, static_cast<int>(cp));
+        if (glyph_index == 0 && cp != 0u) {
+            auto [inserted, _] = face->glyphs.emplace(cp, glyph);
+            return &inserted->second;
+        }
+
+        int advance = 0;
+        int lsb = 0;
+        stbtt_GetCodepointHMetrics(&face->info, static_cast<int>(cp), &advance, &lsb);
+        glyph.advance = std::max(0.0f, static_cast<float>(advance) * face->scale);
+
+        int x0 = 0;
+        int y0 = 0;
+        int x1 = 0;
+        int y1 = 0;
+        stbtt_GetCodepointBitmapBox(&face->info, static_cast<int>(cp), face->scale, face->scale, &x0, &y0, &x1, &y1);
+        const int w = std::max(0, x1 - x0);
+        const int h = std::max(0, y1 - y0);
+        glyph.xoff = static_cast<float>(x0);
+        glyph.yoff = static_cast<float>(y0);
+        glyph.w = static_cast<float>(w);
+        glyph.h = static_cast<float>(h);
+        glyph.valid = true;
+
+        if (w > 0 && h > 0) {
+            std::vector<unsigned char> bitmap(static_cast<std::size_t>(w * h), 0u);
+            stbtt_MakeCodepointBitmap(&face->info, bitmap.data(), w, h, w, face->scale, face->scale,
+                                      static_cast<int>(cp));
+
+            int pad = k_atlas_padding;
+            int upload_w = w + pad * 2;
+            int upload_h = h + pad * 2;
+            if (upload_w > face->cell_size || upload_h > face->cell_size) {
+                pad = 0;
+                upload_w = w;
+                upload_h = h;
+            }
+
+            if (upload_w <= face->cell_size && upload_h <= face->cell_size) {
+                const SlotHandle slot = acquire_slot(face, cp);
+                if (slot.valid && slot.page != nullptr && slot.page->texture_id != 0u) {
+                    const unsigned char* upload_data = bitmap.data();
+                    std::vector<unsigned char> padded_bitmap{};
+                    if (pad > 0) {
+                        padded_bitmap.assign(static_cast<std::size_t>(upload_w * upload_h), 0u);
+                        for (int row = 0; row < h; ++row) {
+                            std::memcpy(&padded_bitmap[static_cast<std::size_t>((row + pad) * upload_w + pad)],
+                                        &bitmap[static_cast<std::size_t>(row * w)], static_cast<std::size_t>(w));
+                        }
+                        upload_data = padded_bitmap.data();
+                    }
+
+                    GLint prev_unpack = 4;
+                    glGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_unpack);
+                    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                    glBindTexture(GL_TEXTURE_2D, slot.page->texture_id);
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, slot.x, slot.y, upload_w, upload_h, GL_ALPHA,
+                                    GL_UNSIGNED_BYTE, upload_data);
+                    glBindTexture(GL_TEXTURE_2D, 0);
+                    glPixelStorei(GL_UNPACK_ALIGNMENT, prev_unpack);
+
+                    const float inv_w = 1.0f / static_cast<float>(slot.page->width);
+                    const float inv_h = 1.0f / static_cast<float>(slot.page->height);
+                    const int uv_x0 = slot.x + pad;
+                    const int uv_y0 = slot.y + pad;
+                    const int uv_x1 = uv_x0 + w;
+                    const int uv_y1 = uv_y0 + h;
+
+                    glyph.texture_id = slot.page->texture_id;
+                    glyph.page_index = static_cast<std::uint16_t>(slot.page_index);
+                    glyph.slot_index = static_cast<std::uint16_t>(slot.slot_index);
+                    glyph.u0 = static_cast<float>(uv_x0) * inv_w;
+                    glyph.v0 = static_cast<float>(uv_y0) * inv_h;
+                    glyph.u1 = static_cast<float>(uv_x1) * inv_w;
+                    glyph.v1 = static_cast<float>(uv_y1) * inv_h;
+                    glyph.has_bitmap = true;
+                }
+            }
+        }
+
+        auto [inserted, _] = face->glyphs.emplace(cp, std::move(glyph));
+        return &inserted->second;
+    }
+
+    std::string text_font_path_{};
+    std::string icon_font_path_{};
+    bool enable_icon_fallback_{true};
+    mutable std::unordered_map<std::string, FontFace> faces_{};
+    mutable std::unordered_map<std::string, std::shared_ptr<std::vector<unsigned char>>> font_blob_cache_{};
+    mutable std::uint64_t face_use_tick_{1u};
+};
+#else
+class StbFontRenderer {
+public:
+    static std::string resolve_font_path_for_measure(const char*, const char*, bool) {
+        return {};
+    }
+    explicit StbFontRenderer(const AppOptions&) {}
+    void release_gl_resources() const {}
+    bool draw_text(const DrawCommand&, std::string_view) const {
+        return false;
+    }
 };
 #endif
 
@@ -3976,14 +5631,29 @@ class Renderer {
 public:
     explicit Renderer(const AppOptions& options = {})
 #ifdef _WIN32
-        : win32_font_renderer_(options)
+        : text_backend_(resolve_text_backend(options))
+#else
+        : stb_font_renderer_(std::make_unique<StbFontRenderer>(options))
 #endif
-    {}
+    {
+#ifdef _WIN32
+        if (text_backend_ == AppOptions::TextBackend::Win32) {
+            win32_font_renderer_ = std::make_unique<Win32FontRenderer>(options);
+        } else {
+            stb_font_renderer_ = std::make_unique<StbFontRenderer>(options);
+        }
+#endif
+    }
 
     void release_gl_resources() const {
 #ifdef _WIN32
-        win32_font_renderer_.release_gl_resources();
+        if (win32_font_renderer_ != nullptr) {
+            win32_font_renderer_->release_gl_resources();
+        }
 #endif
+        if (stb_font_renderer_ != nullptr) {
+            stb_font_renderer_->release_gl_resources();
+        }
     }
 
     void render(const std::vector<DrawCommand>& commands, const std::vector<char>& text_arena, int width,
@@ -4045,7 +5715,8 @@ public:
         if (clip_rect == nullptr || commands.size() < 96u) {
             visible_indices_.reserve(commands.size());
             for (std::size_t i = 0; i < commands.size(); ++i) {
-                if (clip_rect == nullptr || rect_intersects(commands[i].rect, *clip_rect)) {
+                const Rect visible_rect = command_visible_rect(commands[i]);
+                if (clip_rect == nullptr || rect_intersects(visible_rect, *clip_rect)) {
                     visible_indices_.push_back(i);
                 }
             }
@@ -4063,7 +5734,7 @@ public:
             }
 
             for (std::size_t i = 0; i < commands.size(); ++i) {
-                const Rect& rect = commands[i].rect;
+                const Rect rect = command_visible_rect(commands[i]);
                 if (rect.w <= 0.0f || rect.h <= 0.0f || !rect_intersects(rect, *clip_rect)) {
                     continue;
                 }
@@ -4262,7 +5933,8 @@ public:
 
         for (std::size_t draw_idx : visible_indices_) {
             const DrawCommand& cmd = commands[draw_idx];
-            if (clip_rect != nullptr && !rect_intersects(cmd.rect, *clip_rect)) {
+            const Rect visible_rect = command_visible_rect(cmd);
+            if (clip_rect != nullptr && !rect_intersects(visible_rect, *clip_rect)) {
                 continue;
             }
             IRect cmd_gl_clip{};
@@ -4321,11 +5993,20 @@ public:
                     }
 
 #ifdef _WIN32
-                    if (!win32_font_renderer_.draw_text(cmd, text)) {
+                    bool rendered = false;
+                    if (stb_font_renderer_ != nullptr) {
+                        rendered = stb_font_renderer_->draw_text(cmd, text);
+                    }
+                    if (!rendered && win32_font_renderer_ != nullptr) {
+                        rendered = win32_font_renderer_->draw_text(cmd, text);
+                    }
+                    if (!rendered) {
                         draw_text_bitmap(cmd, text);
                     }
 #else
-                    draw_text_bitmap(cmd, text);
+                    if (stb_font_renderer_ == nullptr || !stb_font_renderer_->draw_text(cmd, text)) {
+                        draw_text_bitmap(cmd, text);
+                    }
 #endif
                     break;
                 }
@@ -4337,10 +6018,33 @@ public:
     }
 
 #ifdef _WIN32
+    static AppOptions::TextBackend resolve_text_backend(const AppOptions& options) {
+        using TextBackend = AppOptions::TextBackend;
+        if (options.text_backend == TextBackend::Win32) {
+            return TextBackend::Win32;
+        }
+        if (options.text_backend == TextBackend::Stb) {
+#if EUI_ENABLE_STB_TRUETYPE
+            return TextBackend::Stb;
+#else
+            return TextBackend::Win32;
+#endif
+        }
+#if EUI_ENABLE_STB_TRUETYPE
+        return TextBackend::Stb;
+#else
+        return TextBackend::Win32;
+#endif
+    }
+#endif
+
+#ifdef _WIN32
 private:
-    mutable Win32FontRenderer win32_font_renderer_;
+    AppOptions::TextBackend text_backend_{AppOptions::TextBackend::Auto};
+    mutable std::unique_ptr<Win32FontRenderer> win32_font_renderer_{};
 #endif
 private:
+    mutable std::unique_ptr<StbFontRenderer> stb_font_renderer_{};
     mutable std::vector<std::vector<std::uint32_t>> spatial_buckets_{};
     mutable std::vector<std::uint32_t> spatial_marks_{};
     mutable std::vector<std::size_t> visible_indices_{};
@@ -4399,10 +6103,52 @@ int run(BuildUiFn&& build_ui, const AppOptions& options = {}) {
     detail::RuntimeState runtime{};
     glfwSetWindowUserPointer(window, &runtime);
     glfwSetCharCallback(window, detail::text_input_callback);
+    glfwSetKeyCallback(window, detail::key_input_callback);
     glfwSetScrollCallback(window, detail::scroll_callback);
 
     detail::Renderer renderer(options);
     Context ui;
+#ifdef _WIN32
+    const AppOptions::TextBackend resolved_text_backend = detail::Renderer::resolve_text_backend(options);
+    TextMeasureBackend text_measure_backend = TextMeasureBackend::Approx;
+    std::string text_measure_font_file{};
+    std::string text_measure_icon_font_file{};
+    if (resolved_text_backend == AppOptions::TextBackend::Win32) {
+        text_measure_backend = TextMeasureBackend::Win32;
+    } else if (resolved_text_backend == AppOptions::TextBackend::Stb) {
+        text_measure_backend = TextMeasureBackend::Stb;
+        text_measure_font_file = detail::StbFontRenderer::resolve_font_path_for_measure(
+            options.text_font_file, options.text_font_family, false);
+        text_measure_icon_font_file = detail::StbFontRenderer::resolve_font_path_for_measure(
+            options.icon_font_file, options.icon_font_family, true);
+    }
+    ui.configure_text_measure(text_measure_backend,
+                              options.text_font_family != nullptr ? options.text_font_family : "Segoe UI",
+                              options.text_font_weight, text_measure_font_file,
+                              options.icon_font_family != nullptr ? options.icon_font_family
+                                                                  : "Font Awesome 7 Free Solid",
+                              text_measure_icon_font_file, options.enable_icon_font_fallback);
+#else
+#if EUI_ENABLE_STB_TRUETYPE
+    ui.configure_text_measure(TextMeasureBackend::Stb,
+                              options.text_font_family != nullptr ? options.text_font_family : "Segoe UI",
+                              options.text_font_weight,
+                              detail::StbFontRenderer::resolve_font_path_for_measure(
+                                  options.text_font_file, options.text_font_family, false),
+                              options.icon_font_family != nullptr ? options.icon_font_family
+                                                                  : "Font Awesome 7 Free Solid",
+                              detail::StbFontRenderer::resolve_font_path_for_measure(
+                                  options.icon_font_file, options.icon_font_family, true),
+                              options.enable_icon_font_fallback);
+#else
+    ui.configure_text_measure(TextMeasureBackend::Approx,
+                              options.text_font_family != nullptr ? options.text_font_family : "Segoe UI",
+                              options.text_font_weight, {},
+                              options.icon_font_family != nullptr ? options.icon_font_family
+                                                                  : "Font Awesome 7 Free Solid",
+                              {}, options.enable_icon_font_fallback);
+#endif
+#endif
     double previous_time = glfwGetTime();
     double next_frame_deadline = previous_time;
     bool redraw_needed = true;
@@ -4483,15 +6229,6 @@ int run(BuildUiFn&& build_ui, const AppOptions& options = {}) {
         const bool left_mouse_down = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
         const bool right_mouse_down = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
 
-        const bool backspace_down = glfwGetKey(window, GLFW_KEY_BACKSPACE) == GLFW_PRESS;
-        const bool delete_down = glfwGetKey(window, GLFW_KEY_DELETE) == GLFW_PRESS;
-        const bool enter_down = (glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS) ||
-                                (glfwGetKey(window, GLFW_KEY_KP_ENTER) == GLFW_PRESS);
-        const bool escape_down = glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
-        const bool left_down = glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS;
-        const bool right_down = glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS;
-        const bool home_down = glfwGetKey(window, GLFW_KEY_HOME) == GLFW_PRESS;
-        const bool end_down = glfwGetKey(window, GLFW_KEY_END) == GLFW_PRESS;
         const bool a_down = glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS;
         const bool c_down = glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS;
         const bool v_down = glfwGetKey(window, GLFW_KEY_V) == GLFW_PRESS;
@@ -4511,14 +6248,16 @@ int run(BuildUiFn&& build_ui, const AppOptions& options = {}) {
         input.mouse_right_down = right_mouse_down;
         input.mouse_right_pressed = right_mouse_down && !runtime.prev_right_mouse;
         input.mouse_right_released = !right_mouse_down && runtime.prev_right_mouse;
-        input.key_backspace = backspace_down && !runtime.prev_backspace;
-        input.key_delete = delete_down && !runtime.prev_delete;
-        input.key_enter = enter_down && !runtime.prev_enter;
-        input.key_escape = escape_down && !runtime.prev_escape;
-        input.key_left = left_down && !runtime.prev_left_key;
-        input.key_right = right_down && !runtime.prev_right_key;
-        input.key_home = home_down && !runtime.prev_home_key;
-        input.key_end = end_down && !runtime.prev_end_key;
+        input.key_backspace = runtime.pending_backspace;
+        input.key_delete = runtime.pending_delete;
+        input.key_enter = runtime.pending_enter;
+        input.key_escape = runtime.pending_escape;
+        input.key_left = runtime.pending_left;
+        input.key_right = runtime.pending_right;
+        input.key_up = runtime.pending_up;
+        input.key_down = runtime.pending_down;
+        input.key_home = runtime.pending_home;
+        input.key_end = runtime.pending_end;
         input.key_shift = left_shift_down || right_shift_down;
         input.key_select_all = ctrl_down && a_down && !runtime.prev_a_key;
         input.key_copy = ctrl_down && c_down && !runtime.prev_c_key;
@@ -4542,22 +6281,22 @@ int run(BuildUiFn&& build_ui, const AppOptions& options = {}) {
 
         runtime.text_input.clear();
         runtime.scroll_y_accum = 0.0;
+        runtime.pending_backspace = false;
+        runtime.pending_delete = false;
+        runtime.pending_enter = false;
+        runtime.pending_escape = false;
+        runtime.pending_left = false;
+        runtime.pending_right = false;
+        runtime.pending_up = false;
+        runtime.pending_down = false;
+        runtime.pending_home = false;
+        runtime.pending_end = false;
         runtime.prev_left_mouse = left_mouse_down;
         runtime.prev_right_mouse = right_mouse_down;
-        runtime.prev_backspace = backspace_down;
-        runtime.prev_delete = delete_down;
-        runtime.prev_enter = enter_down;
-        runtime.prev_escape = escape_down;
-        runtime.prev_left_key = left_down;
-        runtime.prev_right_key = right_down;
-        runtime.prev_home_key = home_down;
-        runtime.prev_end_key = end_down;
         runtime.prev_a_key = a_down;
         runtime.prev_c_key = c_down;
         runtime.prev_v_key = v_down;
         runtime.prev_x_key = x_down;
-        runtime.prev_left_shift = left_shift_down;
-        runtime.prev_right_shift = right_shift_down;
         runtime.prev_mouse_x = mouse_x;
         runtime.prev_mouse_y = mouse_y;
         runtime.has_prev_mouse = true;
@@ -4572,7 +6311,8 @@ int run(BuildUiFn&& build_ui, const AppOptions& options = {}) {
         const bool input_event =
             input.mouse_pressed || input.mouse_released || input.mouse_right_pressed ||
             input.mouse_right_released || input.key_backspace || input.key_delete || input.key_enter ||
-            input.key_escape || input.key_left || input.key_right || input.key_home || input.key_end ||
+            input.key_escape || input.key_left || input.key_right || input.key_up || input.key_down ||
+            input.key_home || input.key_end ||
             input.key_select_all || input.key_copy || input.key_cut || input.key_paste ||
             std::fabs(input.mouse_wheel_y) > 1e-6f ||
             !input.text_input.empty();
